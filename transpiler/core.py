@@ -24,10 +24,12 @@ class StyxTransformer(cst.CSTTransformer):
     def __init__(self, entities: Dict[str, str]):
         self.entities = entities
         self.current_operator = None
+        self.self_attr_types: Dict[str, str] = {}
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:
         if node.name.value in self.entities:
             self.current_operator = node.name.value
+            self.self_attr_types = {}
             return True 
         return False 
 
@@ -71,8 +73,64 @@ class StyxTransformer(cst.CSTTransformer):
             return cst.RemoveFromParent()
         else:
             return self.transform_method(updated_node)
+        
+    
+    def _scan_init_for_attr_types(self, node: cst.FunctionDef):
+        # Param name → type
+        param_types = {}
+        for p in node.params.params:
+            if p.annotation and isinstance(p.annotation.annotation, cst.Name):
+                param_types[p.name.value] = p.annotation.annotation.value
+
+        for stmt in node.body.body:
+            if not isinstance(stmt, cst.SimpleStatementLine):
+                continue
+
+            for element in stmt.body:
+
+                # -------- AnnAssign (self.x: Type = ...)
+                if isinstance(element, cst.AnnAssign):
+                    target = element.target
+
+                    if (
+                        isinstance(target, cst.Attribute)
+                        and isinstance(target.value, cst.Name)
+                        and target.value.value == "self"
+                    ):
+                        attr_name = target.attr.value
+
+                        if isinstance(element.annotation.annotation, cst.Name):
+                            type_name = element.annotation.annotation.value
+                            if type_name in self.entities:
+                                self.self_attr_types[attr_name] = type_name
+
+                # -------- Assign (self.x = ...)
+                elif isinstance(element, cst.Assign):
+                    target = element.targets[0].target
+                    value = element.value
+
+                    if (
+                        isinstance(target, cst.Attribute)
+                        and isinstance(target.value, cst.Name)
+                        and target.value.value == "self"
+                    ):
+                        attr_name = target.attr.value
+
+                        # self.x = param
+                        if isinstance(value, cst.Name):
+                            rhs_type = param_types.get(value.value)
+                            if rhs_type in self.entities:
+                                self.self_attr_types[attr_name] = rhs_type
+
+                        # self.x = Entity(...)
+                        elif isinstance(value, cst.Call) and isinstance(value.func, cst.Name):
+                            if value.func.value in self.entities:
+                                self.self_attr_types[attr_name] = value.func.value
+
+
 
     def transform_init(self, node: cst.FunctionDef) -> cst.FunctionDef:
+        self._scan_init_for_attr_types(node)
         new_name = cst.Name(value="create") 
         
         ctx_param = cst.Param(
@@ -108,7 +166,7 @@ class StyxTransformer(cst.CSTTransformer):
 
         put_state = cst.parse_statement("ctx.put(state)")
         
-        return_stmt = cst.parse_statement("return ctx.key()")
+        return_stmt = cst.parse_statement("return ctx.key")
         
         new_block = new_body.with_changes(
             body=[get_state] + body_transformer.other_statements + [put_call, put_state, return_stmt]
@@ -138,7 +196,7 @@ class StyxTransformer(cst.CSTTransformer):
         node = node.visit(linearizer)
 
         # 2. Process and Split
-        processor = FunctionProcessor(node, self.current_operator, self.entities)
+        processor = FunctionProcessor(node, self.current_operator, self.entities, self.self_attr_types)
         new_functions = processor.process()
 
         # 3. Post-Process
@@ -214,8 +272,9 @@ class StyxTranspiler:
 
 # Main execution
 if __name__ == "__main__":
-    input_file = "./original.py"
-    output_file = "./styx_code.py"
+    file_name = "key_reference_simple_example.py"
+    input_file = "./examples/original/" + file_name
+    output_file = "./examples/compiled/" + file_name
 
     try:
         with open(input_file, "r", encoding="utf-8") as f:

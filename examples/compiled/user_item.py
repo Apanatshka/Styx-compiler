@@ -16,10 +16,10 @@ async def create(ctx: StatefulFunction, item_name: str, price: int, reply_to: li
     ctx.put(state)
     if reply_to:
         reply_info = reply_to.pop()
-        ctx.call_remote_async(operator_name = reply_info["op_name"], function_name = reply_info["fun"], key = reply_info["id"], params = (reply_info["context"], ctx.key(), reply_to))
+        ctx.call_remote_async(operator_name = reply_info["op_name"], function_name = reply_info["fun"], key = reply_info["id"], params = (reply_info["context"], ctx.key, reply_to))
         return
     else:
-        return ctx.key()
+        return ctx.key
 
 
 @item_operator.register
@@ -61,17 +61,18 @@ async def create(ctx: StatefulFunction, username: str, reply_to: list = None):
     ctx.put(state)
     if reply_to:
         reply_info = reply_to.pop()
-        ctx.call_remote_async(operator_name = reply_info["op_name"], function_name = reply_info["fun"], key = reply_info["id"], params = (reply_info["context"], ctx.key(), reply_to))
+        ctx.call_remote_async(operator_name = reply_info["op_name"], function_name = reply_info["fun"], key = reply_info["id"], params = (reply_info["context"], ctx.key, reply_to))
         return
     else:
-        return ctx.key()
+        return ctx.key
 
 
 @user_operator.register
 async def buy_item(ctx: StatefulFunction, amount: int, item: Item, reply_to: list = None) -> bool:
     state = ctx.get()
-    reply_to.append({'op_name': 'user', 'fun': 'buy_item_step_1', 'id': item, 'context': {'amount': amount, 'item': item}})
-    ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = None)
+    if reply_to is None: reply_to = []
+    reply_to.append({'op_name': 'user', 'fun': 'buy_item_step_1', 'id': ctx.key, 'context': {'amount': amount, 'item': item}})
+    ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = (reply_to,))
 
 @user_operator.register
 async def buy_item_step_1(ctx: StatefulFunction, params, attr_1 = None, reply_to: list = None):
@@ -82,8 +83,9 @@ async def buy_item_step_1(ctx: StatefulFunction, params, attr_1 = None, reply_to
 
     if state['balance'] < total_price:
         raise NotEnoughBalance()
-    reply_to.append({'op_name': 'user', 'fun': 'buy_item_step_2', 'id': item, 'context': {'state': state, 'total_price': total_price, 'attr_1': attr_1, 'amount': amount, 'item': item}})
-    ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = -amount)
+    if reply_to is None: reply_to = []
+    reply_to.append({'op_name': 'user', 'fun': 'buy_item_step_2', 'id': ctx.key, 'context': {'amount': amount, 'item': item, 'attr_1': attr_1, 'total_price': total_price, 'state': state}})
+    ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = (-amount, reply_to))
 
 @user_operator.register
 async def buy_item_step_2(ctx: StatefulFunction, params, placeholder_return = None, reply_to: list = None):
@@ -103,32 +105,9 @@ async def buy_item_step_2(ctx: StatefulFunction, params, placeholder_return = No
         return True
 
 
-
 @user_operator.register
-async def test(ctx: StatefulFunction, item: Item, reply_to: list = None) -> bool:
+async def temp(ctx: StatefulFunction, item: Item, reply_to: list = None) -> int:
     state = ctx.get()
-    reply_to.append({'op_name': 'user', 'fun': 'test_step_1', 'id': item, 'context': {'item': item}})
-    ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = None)
-
-@user_operator.register
-async def test_step_1(ctx: StatefulFunction, params, placeholder_return = None, reply_to: list = None):
-    state = ctx.get()
-    item = params['item']
-    reply_to.append({'op_name': 'user', 'fun': 'test_step_2', 'id': item, 'context': {'state': state, 'item': item}})
-    ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = None)
-
-@user_operator.register
-async def test_step_2(ctx: StatefulFunction, params, placeholder_return = None, reply_to: list = None):
-    state = ctx.get()
-    item = params['item']
-    state = params['state']
-    reply_to.append({'op_name': 'user', 'fun': 'test_step_3', 'id': item, 'context': {'state': state, 'item': item}})
-    ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = None)
-
-@user_operator.register
-async def test_step_3(ctx: StatefulFunction, params, placeholder_return = None, reply_to: list = None):
-    state = ctx.get()
-    item = params['item']
-    state = params['state']
-    reply_to.append({'op_name': 'user', 'fun': 'None', 'id': item, 'context': {'state': state, 'item': item}})
-    ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = None)
+    if reply_to is None: reply_to = []
+    reply_to.append({'op_name': 'user', 'fun': 'None', 'id': ctx.key, 'context': {'item': item}})
+    ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = (reply_to,))

@@ -9,6 +9,7 @@ class Item:
         self.item_name: str = item_name
         self.stock: int = 0
         self.price: int = price
+        self.userlist = []
 
     def get_price(self) -> int:
         return self.price
@@ -45,3 +46,5 @@ class User:
         self.balance -= total_price
         return True
     
+    def temp(self, item: Item) -> int:
+        item.get_price()

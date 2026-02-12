@@ -6,12 +6,13 @@ class FunctionProcessor:
     Actively slices a function into asynchronous steps using locals().update()
     """
     
-    def __init__(self, original_func: cst.FunctionDef, class_name: str, entities: Dict[str, str]):
+    def __init__(self, original_func: cst.FunctionDef, class_name: str, entities: Dict[str, str], self_attr_types: Dict[str, str]):
         self.original_func = original_func
+        self.self_attr_types = self_attr_types
         self.class_name = class_name
         self.entities = entities
         self.generated_functions: List[cst.FunctionDef] = []
-        self.step_counter = 0
+        self.step_counter = 1
         
         # Track local variables to save/restore
         self.defined_vars = set() 
@@ -60,16 +61,16 @@ class FunctionProcessor:
                         target_var = "placeholder_return"
                         call_node = element.value
 
-                    remote_obj = call_node.func.value.value
+                    receiver  = call_node.func.value
                     remote_method = call_node.func.attr.value
                     
                     # 4. Create dispatch block using the determined next_func_name
-                    dispatch_block = self._create_dispatch_block(remote_obj, remote_method, call_node, next_func_name)
+                    dispatch_block = self._create_dispatch_block(receiver, remote_method, call_node, next_func_name)
                     
                     pre_split_body = current_body[:i] + dispatch_block
 
                     # 5. Modify the current function
-                    if self.step_counter == (1 if has_continuation else 0):
+                    if self.step_counter == (2 if has_continuation else 1):
                         # If this is the first split (or the only split), modify original
                         if first_func_modified is None:
                             first_func_modified = self.original_func.with_changes(
@@ -143,18 +144,60 @@ class FunctionProcessor:
             return False
         
         base = val.func.value
+
+        # Case 1: local variable (existing behavior)
         if isinstance(base, cst.Name):
             var_name = base.value
-            if var_name in self.local_types:
-                var_type = self.local_types[var_name]
-                if var_type in self.entities:
-                    return True
-        return False
+            var_type = self.local_types.get(var_name)
+            if var_type in self.entities:
+                return True
 
-    def _create_dispatch_block(self, obj, method, call_node, reply_to):
+        # Case 2: self.attribute
+        if isinstance(base, cst.Attribute):
+            if (
+                isinstance(base.value, cst.Name)
+                and base.value.value == "self"
+            ):
+                print("Checking self attribute:", base.attr.value)
+                attr_name = base.attr.value
+                attr_type = self.self_attr_types.get(attr_name)
+                print("Attribute type:", attr_type)
+                if attr_type in self.entities:
+                    return True
+
+        return False
+    
+    def _resolve_operator_name(self, receiver: cst.BaseExpression) -> str:
+        """
+        Determine operator name from receiver expression.
+        """
+
+        # Case 1: local variable  -> item.get_price()
+        if isinstance(receiver, cst.Name):
+            var_name = receiver.value
+            var_type = self.local_types.get(var_name)
+            if var_type in self.entities:
+                return self.entities[var_type]
+
+        # Case 2: self.attribute -> self.item.get_price()
+        if isinstance(receiver, cst.Attribute):
+            if (
+                isinstance(receiver.value, cst.Name)
+                and receiver.value.value == "self"
+            ):
+                attr_name = receiver.attr.value
+                attr_type = self.self_attr_types.get(attr_name)
+                if attr_type in self.entities:
+                    return self.entities[attr_type]
+
+        # fallback
+        return self.entities.get(self.class_name)
+
+
+    def _create_dispatch_block(self, receiver, method, call_node, reply_to):
         args = call_node.args[0].value if call_node.args else cst.Name("None")
 
-        op_name = self.entities.get(self.local_types.get(obj, ""), obj)
+        op_name = self._resolve_operator_name(receiver)
         reply_op_name = self.entities[self.class_name]
 
         # context dict
@@ -172,7 +215,13 @@ class FunctionProcessor:
         reply_info_dict = cst.Dict(elements=[
             cst.DictElement(cst.SimpleString("'op_name'"), cst.SimpleString(f"'{reply_op_name}'")),
             cst.DictElement(cst.SimpleString("'fun'"), cst.SimpleString(f"'{reply_to}'")),
-            cst.DictElement(cst.SimpleString("'id'"), cst.parse_expression(f"{obj}")),
+            cst.DictElement(
+                key=cst.SimpleString("'id'"),
+                value=cst.Attribute(
+                    value=cst.Name("ctx"),
+                    attr=cst.Name("key"),
+                ),
+            ),
             cst.DictElement(cst.SimpleString("'context'"), context_dict),
         ])
 
@@ -194,7 +243,7 @@ class FunctionProcessor:
                     args=[
                         cst.Arg(keyword=cst.Name("operator_name"), value=cst.SimpleString(f"'{op_name}'")),
                         cst.Arg(keyword=cst.Name("function_name"), value=cst.SimpleString(f"'{method}'")),
-                        cst.Arg(keyword=cst.Name("key"), value=cst.parse_expression(f"{obj}")),
+                        cst.Arg(keyword=cst.Name("key"), value=receiver),
                         cst.Arg(keyword=cst.Name("params"), value=args),
                     ]
                 )

@@ -128,7 +128,6 @@ class StyxTransformer(cst.CSTTransformer):
                                 self.self_attr_types[attr_name] = value.func.value
 
 
-
     def transform_init(self, node: cst.FunctionDef) -> cst.FunctionDef:
         self._scan_init_for_attr_types(node)
         new_name = cst.Name(value="create") 

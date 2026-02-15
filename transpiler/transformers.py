@@ -219,6 +219,11 @@ class StatementLinearizer(cst.CSTTransformer):
         new_test = updated_node.test.visit(extractor)
         self.counter = extractor.counter
         
+        # If no calls were extracted, return unchanged to avoid
+        # FlattenSentinel in positions that don't support it (e.g. elif)
+        if not extractor.extracted_calls:
+            return updated_node
+
         for var_name, call in extractor.extracted_calls:
             assignment = cst.SimpleStatementLine(
                 body=[cst.Assign(

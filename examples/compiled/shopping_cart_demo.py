@@ -146,15 +146,13 @@ async def create(ctx: StatefulFunction, user: User, reply_to: list = None):
 @order_operator.register
 async def add_item(ctx: StatefulFunction, item: Item, quantity: int, reply_to: list = None):
     state = ctx.get()
-    if reply_to is None: reply_to = []
-    reply_to.append({'op_name': 'order', 'fun': 'add_item_step_1', 'id': ctx.key, 'context': {'item': item, 'quantity': quantity}})
-    ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = (reply_to,))
+    reply_to.append({'op_name': 'order', 'fun': 'add_item_step_2', 'id': ctx.key, 'context': {'item': item, 'quantity': quantity}})
+    ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = reply_to)
 
 @order_operator.register
-async def add_item_step_1(ctx: StatefulFunction, params, price = None, reply_to: list = None):
+async def add_item_step_2(ctx: StatefulFunction, params, price = None, reply_to: list = None):
     state = ctx.get()
-    item = params['item']
-    quantity = params['quantity']
+    (item, quantity) = (params['item'], params['quantity'])
 
     if item in state['items']:
         state['items'][item] += quantity
@@ -176,7 +174,13 @@ async def checkout(ctx: StatefulFunction, reply_to: list = None) -> str:
     state = ctx.get()
     for item, quantity in state['items'].items():
         item.remove_stock(quantity)
-    state['user'].remove_credit(state['total_cost'])
+    reply_to.append({'op_name': 'order', 'fun': 'checkout_step_2', 'id': ctx.key, 'context': {}})
+    ctx.call_remote_async(operator_name = 'user', function_name = 'remove_credit', key = state['user'], params = (state['total_cost'], reply_to))
+
+@order_operator.register
+async def checkout_step_2(ctx: StatefulFunction, params, placeholder_return = None, reply_to: list = None):
+    state = ctx.get()
+    () = ()
     state['paid'] = True
     ctx.put(state)
     if reply_to:

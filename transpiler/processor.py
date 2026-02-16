@@ -310,9 +310,10 @@ class FunctionProcessor:
 
 
     def _create_dispatch_block(self, receiver, method, call_node, next_func_name):
-
         if not call_node.args:
-            params_value = cst.Name("reply_to")
+            params_value = cst.Tuple(
+                elements=[cst.Element(value=cst.Name("reply_to"))]
+            )
         else:
             original_args = [arg.value for arg in call_node.args]
 
@@ -353,6 +354,30 @@ class FunctionProcessor:
             cst.DictElement(cst.SimpleString("'context'"), context_dict),
         ])
 
+        init_reply_to = cst.If(
+            test=cst.Comparison(
+                left=cst.Name("reply_to"),
+                comparisons=[
+                    cst.ComparisonTarget(
+                        operator=cst.Is(),
+                        comparator=cst.Name("None")
+                    )
+                ],
+            ),
+            body=cst.IndentedBlock(
+                body=[
+                    cst.SimpleStatementLine(
+                        body=[
+                            cst.Assign(
+                                targets=[cst.AssignTarget(cst.Name("reply_to"))],
+                                value=cst.List(elements=[])
+                            )
+                        ]
+                    )
+                ]
+            )
+        )
+
         push_reply_info = cst.SimpleStatementLine(
             body=[cst.Expr(
                 value=cst.Call(
@@ -382,7 +407,7 @@ class FunctionProcessor:
         if next_func_name == "None":
             return [async_call]
 
-        return [push_reply_info, async_call]
+        return [init_reply_to, push_reply_info, async_call]
 
     def _create_restore_block(self):
         """Restore locals from params dict"""

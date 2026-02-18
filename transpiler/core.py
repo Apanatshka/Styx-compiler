@@ -12,6 +12,7 @@ from transformers import (
     RemoteCallLinearizer,
     InitBodyTransformer,
     StateAccessTransformer,
+    EntityTypeReplacer,
 )
 from processor import FunctionProcessor
 
@@ -21,8 +22,10 @@ class StyxTransformer(cst.CSTTransformer):
     Main transformer that processes entity classes and converts them to Styx operators.
     """
     
-    def __init__(self, entities: Dict[str, str]):
+    def __init__(self, entities: Dict[str, str], entity_keys: Dict[str, str] = None, entity_init_params: Dict[str, List[str]] = None):
         self.entities = entities
+        self.entity_keys = entity_keys or {}
+        self.entity_init_params = entity_init_params or {}
         self.current_operator = None
         self.self_attr_types: Dict[str, str] = {}
 
@@ -195,7 +198,7 @@ class StyxTransformer(cst.CSTTransformer):
         node = node.visit(linearizer)
 
         # 2. Process and Split
-        processor = FunctionProcessor(node, self.current_operator, self.entities, self.self_attr_types)
+        processor = FunctionProcessor(node, self.current_operator, self.entities, self.self_attr_types, self.entity_keys, self.entity_init_params)
         new_functions = processor.process()
 
         # 3. Post-Process
@@ -261,17 +264,25 @@ class StyxTranspiler:
         visitor = EntityDiscoveryVisitor()
         self.cst_tree.visit(visitor)
         self.entities = visitor.entities
+        self.entity_keys = visitor.entity_keys
+        self.entity_init_params = visitor.entity_init_params
         print(f"Discovered Entities: {self.entities}")
+        print(f"Entity Keys: {self.entity_keys}")
+        print(f"Entity Init Params: {self.entity_init_params}")
 
-        transformer = StyxTransformer(self.entities)
+        transformer = StyxTransformer(self.entities, self.entity_keys, self.entity_init_params)
         modified_tree = self.cst_tree.visit(transformer)
+
+        # Replace entity type annotations with key types
+        type_replacer = EntityTypeReplacer(self.entity_keys, self.entity_init_params)
+        modified_tree = modified_tree.visit(type_replacer)
 
         return modified_tree.code
 
 
 # Main execution
 if __name__ == "__main__":
-    file_name = "key_reference_simple_example.py"
+    file_name = "user_item.py"
     input_file = "./examples/original/" + file_name
     output_file = "./examples/compiled/" + file_name
 

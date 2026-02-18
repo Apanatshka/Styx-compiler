@@ -310,3 +310,27 @@ class StateAccessTransformer(cst.CSTTransformer):
                 ]
             )
         return updated_node
+
+
+class EntityTypeReplacer(cst.CSTTransformer):
+    """
+    Replaces entity type references in annotations with the key's type.
+    e.g., `item: Item` -> `item: str`, `-> Item` -> `-> str`
+    """
+
+    def __init__(self, entity_keys: Dict[str, str], entity_init_params: Dict[str, Dict[str, str]]):
+        self.entity_keys = entity_keys
+        self.entity_init_params = entity_init_params
+
+    def leave_Annotation(self, original_node, updated_node):
+        if isinstance(updated_node.annotation, cst.Name):
+            type_name = updated_node.annotation.value
+            key_field = self.entity_keys.get(type_name)
+            init_params = self.entity_init_params.get(type_name)
+            if key_field and init_params and key_field in init_params:
+                replacement = init_params[key_field]
+                if replacement:
+                    return updated_node.with_changes(
+                        annotation=cst.Name(replacement)
+                    )
+        return updated_node

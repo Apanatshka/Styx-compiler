@@ -6,12 +6,14 @@ class FunctionProcessor:
     Actively slices a function into asynchronous steps using locals().update()
     """
     
-    def __init__(self, original_func: cst.FunctionDef, class_name: str, entities: Dict[str, str], self_attr_types: Dict[str, str]):
+    def __init__(self, original_func: cst.FunctionDef, class_name: str, entities: Dict[str, str], self_attr_types: Dict[str, str], entity_keys: Dict[str, str] = None, entity_init_params: Dict[str, List[str]] = None):
         self.original_func = original_func
         self.class_name = class_name
 
         # Track entities marked with @entity decorator
         self.entities = entities
+        self.entity_keys = entity_keys or {}
+        self.entity_init_params = entity_init_params or {}
 
         self.split_counter = 1
         self.generated_functions: List[cst.FunctionDef] = []
@@ -201,7 +203,6 @@ class FunctionProcessor:
     # ── Helpers ───────────────────────────────────────────────────────
 
     def _extract_call_info(self, stmt):
-        """Extract target_var, call_node, receiver, remote_method from a remote call statement."""
         element = stmt.body[0]
         if isinstance(element, cst.Assign):
             target_var = element.targets[0].target.value
@@ -210,20 +211,33 @@ class FunctionProcessor:
             target_var = "placeholder_return"
             call_node = element.value
         else:
-            raise ValueError(f"Unexpected element type in remote call: {type(element)}")
+            raise ValueError(f"Unexpected element: {type(element)}")
 
-        receiver = call_node.func.value
-        remote_method = call_node.func.attr.value
+        if isinstance(call_node.func, cst.Name):
+            receiver = call_node.func 
+            remote_method = "create"
+        elif isinstance(call_node.func, cst.Attribute):
+            receiver = call_node.func.value
+            remote_method = call_node.func.attr.value
+        else:
+            raise ValueError(f"Unsupported call type: {type(call_node.func)}")
+
         return target_var, call_node, receiver, remote_method
 
     def _track_vars(self, stmt):
-        """Simple tracker for variables assigned on the Left Hand Side"""
         if isinstance(stmt, cst.SimpleStatementLine):
             for element in stmt.body:
                 if isinstance(element, cst.Assign):
+                    assigned_type = None
+                    if isinstance(element.value, cst.Call) and isinstance(element.value.func, cst.Name):
+                        assigned_type = element.value.func.value # e.g., "Item"
+
                     for target in element.targets:
                         if isinstance(target.target, cst.Name):
-                            self.defined_vars.add(target.target.value)
+                            var_name = target.target.value
+                            self.defined_vars.add(var_name)
+                            if assigned_type:
+                                self.local_types[var_name] = assigned_type
         elif isinstance(stmt, cst.If):
             for s in stmt.body.body:
                 self._track_vars(s)
@@ -235,21 +249,12 @@ class FunctionProcessor:
                     self._track_vars(stmt.orelse)
 
     def _is_remote_call(self, stmt):
-        """
-        Determines if a statement is a remote call that needs splitting.
-        """
-        if not isinstance(stmt, cst.SimpleStatementLine): 
-            return False
-        
-        if not stmt.body:
+            
+        if not isinstance(stmt, cst.SimpleStatementLine) or not stmt.body:
             return False
 
         element = stmt.body[0]
-        val = None
-
-        if isinstance(element, cst.Assign):
-            val = element.value
-        elif isinstance(element, cst.Expr):
+        if isinstance(element, (cst.Assign, cst.Expr)):
             val = element.value
         else:
             return False
@@ -257,59 +262,73 @@ class FunctionProcessor:
         if not isinstance(val, cst.Call): 
             return False
             
-        if not isinstance(val.func, cst.Attribute): 
-            return False
-        
-        base = val.func.value
+        # Case 1: entity initialization, item = Item(name, price)
+        if isinstance(val.func, cst.Name):
+            return val.func.value in self.entities
 
-        # Case 1: local variable (existing behavior)
-        if isinstance(base, cst.Name):
-            var_name = base.value
-            var_type = self.local_types.get(var_name)
-            if var_type in self.entities:
-                return True
+        # Case 2 & 3: Attribute calls, e.g., obj.run() or self.obj.run()
+        if isinstance(val.func, cst.Attribute):
+            base = val.func.value
 
-        # Case 2: self.attribute
-        if isinstance(base, cst.Attribute):
-            if (
-                isinstance(base.value, cst.Name)
-                and base.value.value == "self"
-            ):
-                attr_name = base.attr.value
-                attr_type = self.self_attr_types.get(attr_name)
-                if attr_type in self.entities:
-                    return True
+            # Case 2: local variable (item.get_price())
+            if isinstance(base, cst.Name):
+                var_type = self.local_types.get(base.value)
+                return var_type in self.entities
+
+            # Case 3: self attribute (self.item.get_price())
+            if isinstance(base, cst.Attribute) and isinstance(base.value, cst.Name):
+                if base.value.value == "self":
+                    attr_type = self.self_attr_types.get(base.attr.value)
+                    return attr_type in self.entities
 
         return False
     
     def _resolve_operator_name(self, receiver: cst.BaseExpression) -> str:
-        """
-        Determine operator name from receiver expression.
-        """
-
-        # Case 1: local variable  -> item.get_price()
+        # Case: Item() -> receiver is cst.Name(value="Item")
         if isinstance(receiver, cst.Name):
-            var_name = receiver.value
-            var_type = self.local_types.get(var_name)
-            if var_type in self.entities:
-                return self.entities[var_type]
+            name_val = receiver.value
+            # Is it a variable with a known type?
+            if name_val in self.local_types:
+                actual_type = self.local_types[name_val]
+                return self.entities.get(actual_type, actual_type)
+            # Is the name itself an entity (Class name)?
+            if name_val in self.entities:
+                return self.entities[name_val]
 
-        # Case 2: self.attribute -> self.item.get_price()
+        # Case: self.item.method() -> receiver is cst.Attribute
         if isinstance(receiver, cst.Attribute):
-            if (
-                isinstance(receiver.value, cst.Name)
-                and receiver.value.value == "self"
-            ):
+            if isinstance(receiver.value, cst.Name) and receiver.value.value == "self":
                 attr_name = receiver.attr.value
                 attr_type = self.self_attr_types.get(attr_name)
-                if attr_type in self.entities:
-                    return self.entities[attr_type]
+                return self.entities.get(attr_type, attr_type)
 
-        # fallback
-        return self.entities.get(self.class_name)
+        return self.entities.get(self.class_name, "unknown_operator")
 
+    def _resolve_key_for_call(self, receiver, call_node, method):
+        """
+        Resolve the correct key= argument for a remote call.
+        For constructor calls (method='create'), look up which __init__ param
+        is the key field and pick the corresponding argument from the call.
+        For method calls, the receiver variable IS the key.
+        """
+        if method == "create" and isinstance(receiver, cst.Name):
+            entity_class = receiver.value
+            key_field = self.entity_keys.get(entity_class)
+            init_params = self.entity_init_params.get(entity_class)
+
+            if key_field and init_params and key_field in init_params:
+                param_names = list(init_params.keys())
+                key_index = param_names.index(key_field)
+                if key_index < len(call_node.args):
+                    return call_node.args[key_index].value
+
+        # Fallback: use the receiver itself (works for method calls like item.get_price())
+        return receiver
 
     def _create_dispatch_block(self, receiver, method, call_node, next_func_name):
+        # Resolve the correct key for this call
+        key_value = self._resolve_key_for_call(receiver, call_node, method)
+
         if not call_node.args:
             params_value = cst.Tuple(
                 elements=[cst.Element(value=cst.Name("reply_to"))]
@@ -397,7 +416,7 @@ class FunctionProcessor:
                     args=[
                         cst.Arg(keyword=cst.Name("operator_name"), value=cst.SimpleString(f"'{op_name}'")),
                         cst.Arg(keyword=cst.Name("function_name"), value=cst.SimpleString(f"'{method}'")),
-                        cst.Arg(keyword=cst.Name("key"), value=receiver),
+                        cst.Arg(keyword=cst.Name("key"), value=key_value),
                         cst.Arg(keyword=cst.Name("params"), value=params_value),
                     ]
                 )

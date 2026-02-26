@@ -22,13 +22,24 @@ class FunctionProcessor:
         self.self_attr_types = self_attr_types # Entity variables
         self.defined_vars = set()  # Local variables
         self.local_types = {} # Local variable types
+        self.local_collection_element_types = {}  # e.g. {"items": "Item"}
 
         # Pre-scan arguments to define types and initial variables
         for param in original_func.params.params:
             if param.name.value != 'self' and param.name.value != 'ctx':
                 self.defined_vars.add(param.name.value)
-            if param.annotation and isinstance(param.annotation.annotation, cst.Name):
-                self.local_types[param.name.value] = param.annotation.annotation.value
+            if param.annotation:
+                ann = param.annotation.annotation
+                if isinstance(ann, cst.Name):
+                    self.local_types[param.name.value] = ann.value
+                elif isinstance(ann, cst.Subscript) and isinstance(ann.value, cst.Name):
+                    if ann.value.value in ("list", "List", "set", "Set"):
+                        if ann.slice and len(ann.slice) == 1:
+                            inner = ann.slice[0].slice
+                            if isinstance(inner, cst.Index) and isinstance(inner.value, cst.Name):
+                                element_type = inner.value.value
+                                if element_type in self.entities:
+                                    self.local_collection_element_types[param.name.value] = element_type
 
     def process(self) -> List[cst.FunctionDef]:
         """
@@ -57,6 +68,9 @@ class FunctionProcessor:
             # If-statement that contains remote calls in its branches
             if isinstance(stmt, cst.If) and self._contains_remote_call(stmt):
                 return self._handle_if_with_remote_calls(body, i)
+
+
+            if isinstance(stmt, cst)
 
             self._track_vars(stmt)
 
@@ -87,6 +101,13 @@ class FunctionProcessor:
         # Create continuation if there's code after
         if has_continuation:
             restore_block = self._create_restore_block()
+
+            # Track the target variable in the continuation's scope.
+            if target_var != "placeholder_return":
+                self.defined_vars.add(target_var)
+                if remote_method == "create" and isinstance(receiver, cst.Name):
+                    self.local_types[target_var] = receiver.value
+
             cont_body = restore_block + post_split
 
             # Recursively split the continuation body
@@ -247,6 +268,15 @@ class FunctionProcessor:
                         self._track_vars(s)
                 elif isinstance(stmt.orelse, cst.If):
                     self._track_vars(stmt.orelse)
+        elif isinstance(stmt, cst.For):
+            # Infer loop variable type from iterable's collection element type
+            if isinstance(stmt.target, cst.Name) and isinstance(stmt.iter, cst.Name):
+                element_type = self.local_collection_element_types.get(stmt.iter.value)
+                if element_type:
+                    self.local_types[stmt.target.value] = element_type
+                    self.defined_vars.add(stmt.target.value)
+            for s in stmt.body.body:
+                self._track_vars(s)
 
     def _is_remote_call(self, stmt):
             

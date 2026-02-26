@@ -316,21 +316,40 @@ class EntityTypeReplacer(cst.CSTTransformer):
     """
     Replaces entity type references in annotations with the key's type.
     e.g., `item: Item` -> `item: str`, `-> Item` -> `-> str`
+    Also handles: `items: list[Item]` -> `items: list[str]`
     """
 
     def __init__(self, entity_keys: Dict[str, str], entity_init_params: Dict[str, Dict[str, str]]):
         self.entity_keys = entity_keys
         self.entity_init_params = entity_init_params
 
+    def _get_key_type(self, entity_name: str):
+        """Resolve an entity name to its key's type string, or None."""
+        key_field = self.entity_keys.get(entity_name)
+        init_params = self.entity_init_params.get(entity_name)
+        if key_field and init_params and key_field in init_params:
+            return init_params[key_field]
+        return None
+
     def leave_Annotation(self, original_node, updated_node):
-        if isinstance(updated_node.annotation, cst.Name):
-            type_name = updated_node.annotation.value
-            key_field = self.entity_keys.get(type_name)
-            init_params = self.entity_init_params.get(type_name)
-            if key_field and init_params and key_field in init_params:
-                replacement = init_params[key_field]
+        ann = updated_node.annotation
+
+        # Simple type: `item: Item` or `-> Item`
+        if isinstance(ann, cst.Name):
+            replacement = self._get_key_type(ann.value)
+            if replacement:
+                return updated_node.with_changes(annotation=cst.Name(replacement))
+
+        # Subscript type: `items: list[Item]`
+        if isinstance(ann, cst.Subscript) and ann.slice and len(ann.slice) == 1:
+            inner = ann.slice[0].slice
+            if isinstance(inner, cst.Index) and isinstance(inner.value, cst.Name):
+                replacement = self._get_key_type(inner.value.value)
                 if replacement:
-                    return updated_node.with_changes(
-                        annotation=cst.Name(replacement)
-                    )
+                    new_slice = [cst.SubscriptElement(
+                        slice=cst.Index(value=cst.Name(replacement))
+                    )]
+                    new_ann = ann.with_changes(slice=new_slice)
+                    return updated_node.with_changes(annotation=new_ann)
+
         return updated_node

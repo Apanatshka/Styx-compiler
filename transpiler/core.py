@@ -40,6 +40,7 @@ class StyxTransformer(cst.CSTTransformer):
         imports = [
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.operator import Operator").body[0]]),
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.stateful_function import StatefulFunction").body[0]]),
+            cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.logging import logging").body[0]]),
             cst.EmptyLine()
         ]
         
@@ -282,7 +283,7 @@ class StyxTranspiler:
 
 # Main execution
 if __name__ == "__main__":
-    file_name = "user_item.py"
+    file_name = "user_item_2.py"
     input_file = "./examples/original/" + file_name
     output_file = "./examples/compiled/" + file_name
 

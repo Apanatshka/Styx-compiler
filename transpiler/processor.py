@@ -16,6 +16,7 @@ class FunctionProcessor:
         self.entity_init_params = entity_init_params or {}
 
         self.split_counter = 1
+        self.loop_iter_counter = 0
         self.generated_functions: List[cst.FunctionDef] = []
         
         # Track local variables to save/restore
@@ -55,171 +56,325 @@ class FunctionProcessor:
         self.generated_functions.sort(key=lambda f: int(f.name.value.rsplit('_', 1)[-1]))
         return [modified] + self.generated_functions
 
-    def _split_body(self, body: List) -> List:
+    def _split_body(self, body: List, loop_context=None) -> List:
         """
         Scan the function for remote calls and split the function when one is detected.
-        TODO: Handle loops
+
+        loop_context: None for normal mode, or (loop_step_name, op_name, iter_key)
+                      for loop mode where the tail dispatches back to the loop step.
         """
         for i, stmt in enumerate(body):
-            # Linear splitting: remote call at top level
+            # Remote call at top level
             if self._is_remote_call(stmt):
-                return self._handle_remote_call(body, i)
+                return self._handle_remote_call(body, i, loop_context)
 
-            # If-statement that contains remote calls in its branches
-            if isinstance(stmt, cst.If) and self._contains_remote_call(stmt):
-                return self._handle_if_with_remote_calls(body, i)
+            # If-statement with remote calls in any branch
+            if isinstance(stmt, cst.If) and self._if_contains_remote_call(stmt):
+                return self._handle_if(body, i, loop_context)
 
-
-            if isinstance(stmt, cst)
+            # For-loop with remote calls in body
+            if isinstance(stmt, cst.For) and self._for_contains_remote_call(stmt):
+                return self._handle_for(body, i, loop_context)
 
             self._track_vars(stmt)
 
-        # No remote calls found — return body unchanged
-        return body
+        # No remote calls found
+        if loop_context:
+            # Loop mode: direct continuation back to loop step (same entity)
+            loop_step_name, op_name, _ = loop_context
+            put_state = cst.parse_statement("ctx.put(state)")
+            direct_call = self._create_direct_continuation_call(loop_step_name)
+            return body + [put_state] + [direct_call]
+        else:
+            return body
 
-    def _handle_remote_call(self, body: List, i: int) -> List:
-        """
-        Split at a remote call found at index i in body.
-        """
+    def _handle_remote_call(self, body: List, i: int, loop_context=None) -> List:
+        """Split at a remote call found at index i in body."""
         stmt = body[i]
         post_split = body[i+1:]
         has_continuation = len(post_split) > 0
 
-        # Next function name
+        target_var, call_node, receiver, remote_method = self._extract_call_info(stmt)
+
         if has_continuation:
             self.split_counter += 1
             next_func_name = f"{self.original_func.name.value}_step_{self.split_counter}"
-        else:
-            next_func_name = "None"
 
-        # Extract call info and create dispatch
-        target_var, call_node, receiver, remote_method = self._extract_call_info(stmt)
-        dispatch_block = self._create_dispatch_block(receiver, remote_method, call_node, next_func_name)
+            dispatch_block = self._create_dispatch_block(receiver, remote_method, call_node, next_func_name)
 
-        pre_split_body = body[:i] + dispatch_block
-
-        # Create continuation if there's code after
-        if has_continuation:
             restore_block = self._create_restore_block()
 
-            # Track the target variable in the continuation's scope.
             if target_var != "placeholder_return":
                 self.defined_vars.add(target_var)
                 if remote_method == "create" and isinstance(receiver, cst.Name):
                     self.local_types[target_var] = receiver.value
 
-            cont_body = restore_block + post_split
-
-            # Recursively split the continuation body
-            cont_body = self._split_body(cont_body)
+            cont_body = restore_block + self._split_body(post_split, loop_context)
 
             cont_func = self._create_continuation(next_func_name, cont_body, target_var)
             self.generated_functions.append(cont_func)
 
-        return pre_split_body
+            return body[:i] + dispatch_block
+        else:
+            # Last remote call
+            if loop_context:
+                loop_step_name, _, _ = loop_context
+                dispatch_block = self._create_dispatch_block(receiver, remote_method, call_node, loop_step_name)
+            else:
+                dispatch_block = self._create_dispatch_block(receiver, remote_method, call_node, "None")
 
-    def _handle_if_with_remote_calls(self, body: List, i: int) -> List:
-        """
-        Split at an if-statement (at index i) whose branches contain remote calls.
-        """
-        stmt = body[i]
-        post_if_body = body[i+1:]
-        pre_if_body = body[:i]
+            return body[:i] + dispatch_block
 
-        new_body = self._process_if_with_remote_calls(stmt, post_if_body, pre_if_body)
-        return new_body
+    def _handle_if(self, body: List, i: int, loop_context=None) -> List:
+        """Split at an if-statement (at index i) whose branches contain remote calls."""
+        pre_if = body[:i]
+        result = self._process_if_node(body[i], body[i+1:], loop_context)
+        return pre_if + result
 
-
-    def _contains_remote_call(self, node) -> bool:
-        """
-        Recursively checks if a node (If statement, branch body, etc.) 
-        contains any remote calls that need splitting.
-        """
-        if isinstance(node, cst.If):
-            # Check the if-body
-            for stmt in node.body.body:
-                if self._is_remote_call(stmt):
-                    return True
-                if isinstance(stmt, cst.If) and self._contains_remote_call(stmt):
-                    return True
-            # Check elif/else
-            if node.orelse is not None:
-                if isinstance(node.orelse, cst.Else):
-                    for stmt in node.orelse.body.body:
-                        if self._is_remote_call(stmt):
-                            return True
-                        if isinstance(stmt, cst.If) and self._contains_remote_call(stmt):
-                            return True
-                elif isinstance(node.orelse, cst.If):
-                    if self._contains_remote_call(node.orelse):
-                        return True
-            return False
-        return False
-
-    def _branch_has_remote_call(self, stmts: List) -> bool:
-        """Check if a flat list of statements contains any remote call."""
-        for stmt in stmts:
-            if self._is_remote_call(stmt):
-                return True
-            if isinstance(stmt, cst.If) and self._contains_remote_call(stmt):
-                return True
-        return False
-
-    def _process_if_with_remote_calls(self, if_stmt: cst.If, post_if_body: List, pre_if_body: List) -> List:
-        """
-        Process an if-statement whose branches contain remote calls.
-        
-        Strategy:
-        - For each branch (if-body, else-body), scan for the first remote call
-        - When found: emit the dispatch inside that branch,
-          create a continuation function for the rest of that branch + post-if tail
-        - When not found: inline the branch body + post-if tail
-        - When there's no else and the if-branch dispatches, create an else
-          with the post-if tail to prevent fallthrough after dispatch
-        """
-        
-        # Process the if-true branch
+    def _process_if_node(self, if_stmt, post_if, loop_context=None):
+        """Recursively process an if/elif node. Returns a list of statements."""
         if_body_stmts = list(if_stmt.body.body)
-        if_branch_dispatches = self._branch_has_remote_call(if_body_stmts)
-        new_if_body = self._split_body(if_body_stmts + post_if_body)
-        
-        # Process else/elif branch  
+        if_branch_dispatches = self._any_remote_call(if_body_stmts)
+        new_if_body = self._split_body(if_body_stmts + post_if, loop_context)
+
+        # Process else/elif branch
         new_else = None
         if if_stmt.orelse is not None:
             if isinstance(if_stmt.orelse, cst.Else):
                 else_body_stmts = list(if_stmt.orelse.body.body)
-                new_else_body = self._split_body(else_body_stmts + post_if_body)
-                new_else = cst.Else(
-                    body=cst.IndentedBlock(body=new_else_body)
-                )
+                new_else_body = self._split_body(else_body_stmts + post_if, loop_context)
+                new_else = cst.Else(body=cst.IndentedBlock(body=new_else_body))
             elif isinstance(if_stmt.orelse, cst.If):
-                # elif chain: treat as nested if with the same post-if tail
-                elif_body = self._process_if_with_remote_calls(
-                    if_stmt.orelse, post_if_body, []
-                )
-                if len(elif_body) == 1 and isinstance(elif_body[0], cst.If):
-                    new_else = elif_body[0]
+                # elif chain
+                elif_result = self._process_if_node(if_stmt.orelse, post_if, loop_context)
+                if len(elif_result) == 1 and isinstance(elif_result[0], cst.If):
+                    new_else = elif_result[0]
                 else:
-                    new_else = cst.Else(
-                        body=cst.IndentedBlock(body=elif_body)
-                    )
-        elif if_branch_dispatches and post_if_body:
-            # Process the post-if body so remote calls within it are also split.
-            processed_post_if = self._split_body(post_if_body)
-            new_else = cst.Else(
-                body=cst.IndentedBlock(body=processed_post_if)
-            )
+                    new_else = cst.Else(body=cst.IndentedBlock(body=elif_result))
+        elif if_branch_dispatches and post_if:
+            # No else but if-branch dispatches — put post-if in else to prevent fallthrough
+            processed_post_if = self._split_body(post_if, loop_context)
+            new_else = cst.Else(body=cst.IndentedBlock(body=processed_post_if))
 
-        # Rebuild the if statement
         new_if = if_stmt.with_changes(
             body=cst.IndentedBlock(body=new_if_body),
             orelse=new_else
         )
-        
-        if if_stmt.orelse is not None or (if_branch_dispatches and post_if_body):
-            return pre_if_body + [new_if]
+
+        if if_stmt.orelse is not None or (if_branch_dispatches and post_if):
+            return [new_if]
         else:
-            return pre_if_body + [new_if] + post_if_body
+            return [new_if] + post_if
+
+    def _handle_for(self, body: List, i: int, loop_context=None) -> List:
+        """
+        Split at a for-loop whose body contains remote calls.
+        """
+        for_stmt = body[i]
+        pre_loop = body[:i]
+        post_loop = body[i+1:]
+
+        op_name = self.entities[self.class_name]
+
+        # Current loop level
+        self.loop_iter_counter += 1
+        iter_key = f"'__loop_iter_{self.loop_iter_counter}'"
+
+        self.split_counter += 1
+        loop_step_name = f"{self.original_func.name.value}_step_{self.split_counter}"
+
+        # Init block: state[iter_key] = iter(iterable)
+        init_iter = cst.SimpleStatementLine(
+            body=[cst.Assign(
+                targets=[cst.AssignTarget(
+                    target=cst.Subscript(
+                        value=cst.Name("state"),
+                        slice=[cst.SubscriptElement(
+                            slice=cst.Index(value=cst.SimpleString(iter_key))
+                        )]
+                    )
+                )],
+                value=cst.Call(
+                    func=cst.Name("iter"),
+                    args=[cst.Arg(value=for_stmt.iter)]
+                )
+            )]
+        )
+        put_state = cst.parse_statement("ctx.put(state)")
+
+        # Direct call to looping part of the function
+        direct_call = self._create_direct_continuation_call(loop_step_name)
+        restore_block = self._create_restore_block()
+
+        # track loop variable (after context/restore are built)
+        loop_var_name = "_loop_var"
+        if isinstance(for_stmt.target, cst.Name):
+            loop_var_name = for_stmt.target.value
+            self.defined_vars.add(loop_var_name)
+            if isinstance(for_stmt.iter, cst.Name):
+                element_type = self.local_collection_element_types.get(for_stmt.iter.value)
+                if element_type:
+                    self.local_types[loop_var_name] = element_type
+
+        # Build try: var = next(iter) / except StopIteration: <post-loop>
+        next_assign = cst.SimpleStatementLine(
+            body=[cst.Assign(
+                targets=[cst.AssignTarget(target=cst.Name(loop_var_name))],
+                value=cst.Call(
+                    func=cst.Name("next"),
+                    args=[cst.Arg(value=cst.Subscript(
+                        value=cst.Name("state"),
+                        slice=[cst.SubscriptElement(
+                            slice=cst.Index(value=cst.SimpleString(iter_key))
+                        )]
+                    ))]
+                )
+            )]
+        )
+
+        # Post-loop code: processed with the OUTER loop_context (not this loop's)
+        if post_loop:
+            post_loop_body = self._split_body(post_loop, loop_context)
+        else:
+            post_loop_body = [cst.SimpleStatementLine(body=[cst.Return(value=None)])]
+
+        # Process loop body in loop mode
+        inner_loop_context = (loop_step_name, op_name, iter_key)
+        loop_body_stmts = list(for_stmt.body.body)
+        loop_body_processed = self._split_body(loop_body_stmts, inner_loop_context)
+
+        # Structure depends on nesting: nested loops put body inside try to avoid fallthrough
+        if loop_context is not None:
+            # Nested: body inside try block
+            try_block = cst.Try(
+                body=cst.IndentedBlock(body=[next_assign] + loop_body_processed),
+                handlers=[cst.ExceptHandler(
+                    type=cst.Name("StopIteration"),
+                    body=cst.IndentedBlock(body=post_loop_body)
+                )]
+            )
+            loop_step_body = restore_block + [try_block]
+        else:
+            # Top-level: try/except then body (StopIteration returns/dispatches)
+            try_block = cst.Try(
+                body=cst.IndentedBlock(body=[next_assign]),
+                handlers=[cst.ExceptHandler(
+                    type=cst.Name("StopIteration"),
+                    body=cst.IndentedBlock(body=post_loop_body)
+                )]
+            )
+            loop_step_body = restore_block + [try_block] + loop_body_processed
+
+        cont_func = self._create_continuation(loop_step_name, loop_step_body, "placeholder_return")
+        self.generated_functions.append(cont_func)
+
+        return pre_loop + [init_iter, put_state] + [direct_call]
+
+
+
+
+
+    def _create_direct_continuation_call(self, func_name: str):
+        """
+        Create a call_remote_async to a continuation on the same entity,
+        without building a reply_to entry.
+        """
+        op_name = self.entities[self.class_name]
+
+        context_entries = [
+            cst.DictElement(
+                key=cst.SimpleString(f"'{v}'"),
+                value=cst.Name(v)
+            )
+            for v in sorted(self.defined_vars)
+        ]
+        context_dict = cst.Dict(elements=context_entries)
+
+        params_tuple = cst.Tuple(elements=[
+            cst.Element(value=context_dict),
+            cst.Element(value=cst.Name("None")),
+            cst.Element(value=cst.Name("reply_to")),
+        ])
+
+        return cst.SimpleStatementLine(
+            body=[cst.Expr(value=cst.Call(
+                func=cst.parse_expression("ctx.call_remote_async"),
+                args=[
+                    cst.Arg(keyword=cst.Name("operator_name"), value=cst.SimpleString(f"'{op_name}'")),
+                    cst.Arg(keyword=cst.Name("function_name"), value=cst.SimpleString(f"'{func_name}'")),
+                    cst.Arg(keyword=cst.Name("key"), value=cst.Attribute(value=cst.Name("ctx"), attr=cst.Name("key"))),
+                    cst.Arg(keyword=cst.Name("params"), value=params_tuple),
+                ]
+            ))]
+        )
+
+    def _any_remote_call(self, stmts: List) -> bool:
+        """Recursively check if any statement in the list contains a remote call."""
+        for stmt in stmts:
+            if self._is_remote_call(stmt):
+                return True
+            if isinstance(stmt, cst.If):
+                if self._any_remote_call(list(stmt.body.body)):
+                    return True
+                if stmt.orelse is not None:
+                    if isinstance(stmt.orelse, cst.Else):
+                        if self._any_remote_call(list(stmt.orelse.body.body)):
+                            return True
+                    elif isinstance(stmt.orelse, cst.If):
+                        if self._any_remote_call([stmt.orelse]):
+                            return True
+            if isinstance(stmt, cst.For):
+                if self._for_contains_remote_call(stmt):
+                    return True
+        return False
+
+    def _if_contains_remote_call(self, node: cst.If) -> bool:
+        """Check if any branch of an if-statement contains remote calls."""
+        if self._any_remote_call(list(node.body.body)):
+            return True
+        if node.orelse is not None:
+            if isinstance(node.orelse, cst.Else):
+                if self._any_remote_call(list(node.orelse.body.body)):
+                    return True
+            elif isinstance(node.orelse, cst.If):
+                if self._if_contains_remote_call(node.orelse):
+                    return True
+        return False
+
+    def _for_contains_remote_call(self, node: cst.For) -> bool:
+        """Check if a For loop's body contains remote calls, with temp type inference."""
+        temp_types = {}
+        
+        # Temporarily infer loop variable type from direct iteration
+        if isinstance(node.target, cst.Name) and isinstance(node.iter, cst.Name):
+            loop_var_name = node.target.value
+            element_type = self.local_collection_element_types.get(node.iter.value)
+            if element_type and element_type in self.entities:
+                temp_types[loop_var_name] = element_type
+                self.local_types[loop_var_name] = element_type
+
+        # Temporarily infer types from body assignments like item = cart[index]
+        for stmt in node.body.body:
+            if isinstance(stmt, cst.SimpleStatementLine):
+                for el in stmt.body:
+                    if isinstance(el, cst.Assign) and isinstance(el.value, cst.Subscript):
+                        if isinstance(el.value.value, cst.Name):
+                            collection_name = el.value.value.value
+                            element_type = self.local_collection_element_types.get(collection_name)
+                            if element_type and element_type in self.entities:
+                                for target in el.targets:
+                                    if isinstance(target.target, cst.Name):
+                                        var_name = target.target.value
+                                        temp_types[var_name] = element_type
+                                        self.local_types[var_name] = element_type
+
+        result = self._any_remote_call(list(node.body.body))
+
+        # Clean up temporary types
+        for var_name in temp_types:
+            if var_name not in self.defined_vars:
+                self.local_types.pop(var_name, None)
+        return result
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -250,8 +405,15 @@ class FunctionProcessor:
             for element in stmt.body:
                 if isinstance(element, cst.Assign):
                     assigned_type = None
+                    # Constructor call: item = Item(...)
                     if isinstance(element.value, cst.Call) and isinstance(element.value.func, cst.Name):
                         assigned_type = element.value.func.value # e.g., "Item"
+                    # Subscript access: item = cart[index] where cart: list[Item]
+                    elif isinstance(element.value, cst.Subscript) and isinstance(element.value.value, cst.Name):
+                        collection_name = element.value.value.value
+                        element_type = self.local_collection_element_types.get(collection_name)
+                        if element_type:
+                            assigned_type = element_type
 
                     for target in element.targets:
                         if isinstance(target.target, cst.Name):

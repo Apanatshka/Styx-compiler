@@ -87,7 +87,6 @@ class User:
                 
                 # Condition 3: Check if adding this specific bulk breaks the bank
                 if (total_cost + current_item_cost) > self.balance:
-                    logging.warn("Cart exceeded balance during processing.")
                     raise NotEnoughBalance("Cannot afford the entire cart.")
                 else:
                     item.update_stock(-requested_amount)
@@ -97,7 +96,7 @@ class User:
                     for copy in range(requested_amount):
                         self.myitems.append(item)
             else:
-                logging.warn(f"Skipping {item.item_name} due to low stock.")
+                logging.warn(f"Skipping {item} due to low stock.")
         
         self.balance -= total_cost
         

@@ -135,7 +135,17 @@ class FunctionProcessor:
         """Recursively process an if/elif node. Returns a list of statements."""
         if_body_stmts = list(if_stmt.body.body)
         if_branch_dispatches = self._any_remote_call(if_body_stmts)
+
+        # Snapshot before branching
+        saved_vars = self.defined_vars.copy()
+        saved_types = self.local_types.copy()
+
+        # Process if-branch
         new_if_body = self._split_body(if_body_stmts + post_if, loop_context)
+
+        # Restore for else/elif branch
+        self.defined_vars = saved_vars.copy()
+        self.local_types = saved_types.copy()
 
         # Process else/elif branch
         new_else = None
@@ -156,6 +166,10 @@ class FunctionProcessor:
             processed_post_if = self._split_body(post_if, loop_context)
             new_else = cst.Else(body=cst.IndentedBlock(body=processed_post_if))
 
+        # Restore to pre-branch state (caller determines what's defined after)
+        self.defined_vars = saved_vars
+        self.local_types = saved_types
+
         new_if = if_stmt.with_changes(
             body=cst.IndentedBlock(body=new_if_body),
             orelse=new_else
@@ -165,6 +179,21 @@ class FunctionProcessor:
             return [new_if]
         else:
             return [new_if] + post_if
+
+    def _parse_loop_iter(self, iter_node):
+        """Returns (start_expr, bound_expr, is_range). Supports range() and collection iteration."""
+        if isinstance(iter_node, cst.Call) and isinstance(iter_node.func, cst.Name) and iter_node.func.value == "range":
+            if len(iter_node.args) == 1:
+                return cst.Integer("0"), iter_node.args[0].value, True
+            elif len(iter_node.args) >= 2:
+                return iter_node.args[0].value, iter_node.args[1].value, True
+        
+        # Collection iteration (for item in items)
+        bound = cst.Call(
+            func=cst.Name("len"),
+            args=[cst.Arg(value=iter_node)]
+        )
+        return cst.Integer("0"), bound, False
 
     def _handle_for(self, body: List, i: int, loop_context=None) -> List:
         """
@@ -178,12 +207,14 @@ class FunctionProcessor:
 
         # Current loop level
         self.loop_iter_counter += 1
-        iter_key = f"'__loop_iter_{self.loop_iter_counter}'"
+        iter_key = f"'__loop_index_{self.loop_iter_counter}'"
 
         self.split_counter += 1
         loop_step_name = f"{self.original_func.name.value}_step_{self.split_counter}"
 
-        # Init block: state[iter_key] = iter(iterable)
+        start_expr, bound_expr, is_range = self._parse_loop_iter(for_stmt.iter)
+
+        # Init block: state[iter_key] = start_expr
         init_iter = cst.SimpleStatementLine(
             body=[cst.Assign(
                 targets=[cst.AssignTarget(
@@ -194,10 +225,7 @@ class FunctionProcessor:
                         )]
                     )
                 )],
-                value=cst.Call(
-                    func=cst.Name("iter"),
-                    args=[cst.Arg(value=for_stmt.iter)]
-                )
+                value=start_expr
             )]
         )
         put_state = cst.parse_statement("ctx.put(state)")
@@ -206,31 +234,49 @@ class FunctionProcessor:
         direct_call = self._create_direct_continuation_call(loop_step_name)
         restore_block = self._create_restore_block()
 
-        # track loop variable (after context/restore are built)
+        # Determine loop variable name and type (but don't add to defined_vars yet)
         loop_var_name = "_loop_var"
+        loop_var_type = None
         if isinstance(for_stmt.target, cst.Name):
             loop_var_name = for_stmt.target.value
-            self.defined_vars.add(loop_var_name)
-            if isinstance(for_stmt.iter, cst.Name):
-                element_type = self.local_collection_element_types.get(for_stmt.iter.value)
-                if element_type:
-                    self.local_types[loop_var_name] = element_type
+            if not is_range:
+                if isinstance(for_stmt.iter, cst.Name):
+                    element_type = self.local_collection_element_types.get(for_stmt.iter.value)
+                    if element_type:
+                        loop_var_type = element_type
 
-        # Build try: var = next(iter) / except StopIteration: <post-loop>
-        next_assign = cst.SimpleStatementLine(
+        # Generate assignment for the loop var and increment
+        state_idx_access = cst.Subscript(
+            value=cst.Name("state"),
+            slice=[cst.SubscriptElement(slice=cst.Index(value=cst.SimpleString(iter_key)))]
+        )
+
+        if is_range:
+            var_val = state_idx_access
+        else:
+            var_val = cst.Subscript(
+                value=for_stmt.iter,
+                slice=[cst.SubscriptElement(slice=cst.Index(value=state_idx_access))]
+            )
+
+        var_assign = cst.SimpleStatementLine(
             body=[cst.Assign(
                 targets=[cst.AssignTarget(target=cst.Name(loop_var_name))],
-                value=cst.Call(
-                    func=cst.Name("next"),
-                    args=[cst.Arg(value=cst.Subscript(
-                        value=cst.Name("state"),
-                        slice=[cst.SubscriptElement(
-                            slice=cst.Index(value=cst.SimpleString(iter_key))
-                        )]
-                    ))]
-                )
+                value=var_val
             )]
         )
+
+        inc_idx = cst.SimpleStatementLine(
+            body=[cst.AugAssign(
+                target=state_idx_access,
+                operator=cst.AddAssign(),
+                value=cst.Integer("1")
+            )]
+        )
+
+        # Snapshot before processing branches
+        saved_vars = self.defined_vars.copy()
+        saved_types = self.local_types.copy()
 
         # Post-loop code: processed with the OUTER loop_context (not this loop's)
         if post_loop:
@@ -238,40 +284,47 @@ class FunctionProcessor:
         else:
             post_loop_body = [cst.SimpleStatementLine(body=[cst.Return(value=None)])]
 
+        # Restore before processing loop body (independent path)
+        self.defined_vars = saved_vars.copy()
+        self.local_types = saved_types.copy()
+
+        # Track loop variable for the loop body
+        if loop_var_name != "_loop_var":
+            self.defined_vars.add(loop_var_name)
+            if loop_var_type:
+                self.local_types[loop_var_name] = loop_var_type
+
         # Process loop body in loop mode
         inner_loop_context = (loop_step_name, op_name, iter_key)
         loop_body_stmts = list(for_stmt.body.body)
         loop_body_processed = self._split_body(loop_body_stmts, inner_loop_context)
 
-        # Structure depends on nesting: nested loops put body inside try to avoid fallthrough
-        if loop_context is not None:
-            # Nested: body inside try block
-            try_block = cst.Try(
-                body=cst.IndentedBlock(body=[next_assign] + loop_body_processed),
-                handlers=[cst.ExceptHandler(
-                    type=cst.Name("StopIteration"),
-                    body=cst.IndentedBlock(body=post_loop_body)
-                )]
+        # Restore to pre-branch state
+        self.defined_vars = saved_vars
+        self.local_types = saved_types
+
+        # Use if/else structure for bounds checking
+        loop_condition = cst.Comparison(
+            left=state_idx_access,
+            comparisons=[cst.ComparisonTarget(
+                operator=cst.GreaterThanEqual(),
+                comparator=bound_expr
+            )]
+        )
+
+        if_block = cst.If(
+            test=loop_condition,
+            body=cst.IndentedBlock(body=post_loop_body),
+            orelse=cst.Else(
+                body=cst.IndentedBlock(body=[var_assign, inc_idx] + loop_body_processed)
             )
-            loop_step_body = restore_block + [try_block]
-        else:
-            # Top-level: try/except then body (StopIteration returns/dispatches)
-            try_block = cst.Try(
-                body=cst.IndentedBlock(body=[next_assign]),
-                handlers=[cst.ExceptHandler(
-                    type=cst.Name("StopIteration"),
-                    body=cst.IndentedBlock(body=post_loop_body)
-                )]
-            )
-            loop_step_body = restore_block + [try_block] + loop_body_processed
+        )
+        loop_step_body = restore_block + [if_block]
 
         cont_func = self._create_continuation(loop_step_name, loop_step_body, "placeholder_return")
         self.generated_functions.append(cont_func)
 
         return pre_loop + [init_iter, put_state] + [direct_call]
-
-
-
 
 
     def _create_direct_continuation_call(self, func_name: str):
@@ -597,8 +650,6 @@ class FunctionProcessor:
                 )
             )]
         )
-
-        put_state = cst.parse_statement("ctx.put(state)")
 
         # remote call becomes an async statement
         async_call = cst.SimpleStatementLine(

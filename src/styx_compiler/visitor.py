@@ -12,6 +12,7 @@ class EntityDiscoveryVisitor(cst.CSTVisitor):
     """
 
     def __init__(self):
+        super().__init__()
         self.entities = {}
         self.entity_keys = {}
         self.entity_init_params = {}  # e.g. {"Item": {"item_name": "str", "price": "int"}}

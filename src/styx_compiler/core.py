@@ -3,6 +3,7 @@ Main Styx transpiler implementation.
 """
 
 import libcst as cst
+from libcst import FlattenSentinel, FunctionDef, RemovalSentinel
 
 from styx_compiler.config import N_PARTITIONS
 from styx_compiler.processor import FunctionProcessor
@@ -24,9 +25,10 @@ class StyxTransformer(cst.CSTTransformer):
     def __init__(
         self,
         entities: dict[str, str],
-        entity_keys: dict[str, str] = None,
-        entity_init_params: dict[str, list[str]] = None,
+        entity_keys: dict[str, str] | None = None,
+        entity_init_params: dict[str, list[str]] | None = None,
     ):
+        super().__init__()
         self.entities = entities
         self.entity_keys = entity_keys or {}
         self.entity_init_params = entity_init_params or {}
@@ -40,7 +42,7 @@ class StyxTransformer(cst.CSTTransformer):
             return True
         return False
 
-    def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
+    def leave_Module(self, _original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
         imports = [
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.operator import Operator").body[0]]),
             cst.SimpleStatementLine(
@@ -67,7 +69,7 @@ class StyxTransformer(cst.CSTTransformer):
         new_nodes = [op_def_node, cst.EmptyLine()]
 
         for statement in updated_node.body.body:
-            if isinstance(statement, cst.FunctionDef) or isinstance(statement, cst.ClassDef):
+            if isinstance(statement, (cst.FunctionDef, cst.ClassDef)):
                 new_nodes.append(statement)
                 new_nodes.append(cst.EmptyLine())
 
@@ -75,7 +77,7 @@ class StyxTransformer(cst.CSTTransformer):
 
     def leave_FunctionDef(
         self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
-    ) -> cst.FunctionDef | cst.FlattenSentinel:
+    ) -> FunctionDef | RemovalSentinel | FlattenSentinel:
         func_name = original_node.name.value
 
         if func_name == "__init__":
@@ -163,7 +165,7 @@ class StyxTransformer(cst.CSTTransformer):
         return_stmt = cst.parse_statement("return ctx.key")
 
         new_block = new_body.with_changes(
-            body=[get_state] + body_transformer.other_statements + [put_call, put_state, return_stmt]
+            body=[get_state, *body_transformer.other_statements, put_call, put_state, return_stmt]
         )
         reply_to_transformer = ReturnHandlerTransformer()
         final_block = new_block.visit(reply_to_transformer)
@@ -195,22 +197,24 @@ class StyxTransformer(cst.CSTTransformer):
 
         for func in new_functions:
             state_transformer = StateAccessTransformer()
-            func = func.visit(state_transformer)
+            transformed_func = func.visit(state_transformer)
 
-            if func.name.value == node.name.value:
+            if transformed_func.name.value == node.name.value:
                 get_state = cst.parse_statement("state = ctx.get()")
-                func = func.with_changes(body=cst.IndentedBlock(body=[get_state] + list(func.body.body)))
+                transformed_func = transformed_func.with_changes(
+                    body=cst.IndentedBlock(body=[get_state, *list(transformed_func.body.body)])
+                )
 
                 reply_to_transformer = ReturnHandlerTransformer()
-                func = func.visit(reply_to_transformer)
+                transformed_func = transformed_func.visit(reply_to_transformer)
 
-                func = self._finalize_original_signature(func)
+                transformed_func = self._finalize_original_signature(transformed_func)
             else:
                 # Apply Return Handler to continuations
                 reply_to_transformer = ReturnHandlerTransformer()
-                func = func.visit(reply_to_transformer)
+                transformed_func = transformed_func.visit(reply_to_transformer)
 
-            final_nodes.append(func)
+            final_nodes.append(transformed_func)
             final_nodes.append(cst.EmptyLine())
 
         return cst.FlattenSentinel(final_nodes)

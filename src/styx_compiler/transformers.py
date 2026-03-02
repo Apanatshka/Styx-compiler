@@ -13,6 +13,7 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
     """
 
     def __init__(self):
+        super().__init__()
         self.state_dirty_stack = [False]
 
     def _mark_dirty(self):
@@ -52,18 +53,18 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
 
         return False
 
-    def leave_Assign(self, original_node, updated_node):
+    def leave_Assign(self, _original_node, updated_node):
         for target in updated_node.targets:
             if m.matches(target.target, m.Subscript(value=m.Name("state"))):
                 self._mark_dirty()
         return updated_node
 
-    def leave_AugAssign(self, original_node, updated_node):
+    def leave_AugAssign(self, _original_node, updated_node):
         if m.matches(updated_node.target, m.Subscript(value=m.Name("state"))):
             self._mark_dirty()
         return updated_node
 
-    def leave_SimpleStatementLine(self, original_node, updated_node):
+    def leave_SimpleStatementLine(self, _original_node, updated_node):
         return_node = None
         for node in updated_node.body:
             if isinstance(node, cst.Return):
@@ -109,18 +110,16 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
 
         put_state = cst.parse_statement("ctx.put(state)")
 
-        res = cst.FlattenSentinel([put_state, if_stmt]) if self.state_dirty_stack[-1] else if_stmt
+        return cst.FlattenSentinel([put_state, if_stmt]) if self.state_dirty_stack[-1] else if_stmt
 
-        return res
-
-    def leave_FunctionDef(self, original_node, updated_node):
+    def leave_FunctionDef(self, _original_node, updated_node):
         if self.state_dirty_stack[-1]:
             body_stmts = updated_node.body.body
             last_stmt = body_stmts[-1] if body_stmts else None
 
             if not self._is_graph_terminal(last_stmt):
                 put_state = cst.parse_statement("ctx.put(state)")
-                new_body = list(updated_node.body.body) + [put_state]
+                new_body = [*list(updated_node.body.body), put_state]
 
                 return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
 
@@ -133,9 +132,10 @@ class RemoteCallLinearizer(cst.CSTTransformer):
     """
 
     def __init__(self):
+        super().__init__()
         self.call_counter = 0
 
-    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
+    def leave_FunctionDef(self, _original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
         """Process each function and linearize remote calls."""
         self.call_counter = 0
 
@@ -151,10 +151,11 @@ class StatementLinearizer(cst.CSTTransformer):
     """
 
     def __init__(self):
+        super().__init__()
         self.counter = 1
 
     def leave_SimpleStatementLine(
-        self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine
+        self, _original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine
     ) -> cst.SimpleStatementLine | cst.FlattenSentinel[cst.SimpleStatementLine]:
         """Process each statement and extract method calls."""
         new_statements = []
@@ -174,9 +175,13 @@ class StatementLinearizer(cst.CSTTransformer):
                     if new_stmt.value.value == last_extracted_var:
                         should_collapse = True
 
-                elif isinstance(new_stmt, cst.Assign) and len(new_stmt.targets) == 1:
-                    if isinstance(new_stmt.value, cst.Name) and new_stmt.value.value == last_extracted_var:
-                        should_collapse = True
+                elif (
+                    isinstance(new_stmt, cst.Assign)
+                    and len(new_stmt.targets) == 1
+                    and isinstance(new_stmt.value, cst.Name)
+                    and new_stmt.value.value == last_extracted_var
+                ):
+                    should_collapse = True
 
             if should_collapse:
                 extractor.extracted_calls.pop()
@@ -194,7 +199,7 @@ class StatementLinearizer(cst.CSTTransformer):
 
         return cst.FlattenSentinel(new_statements)
 
-    def leave_If(self, original_node: cst.If, updated_node: cst.If) -> cst.If | cst.FlattenSentinel[cst.BaseStatement]:
+    def leave_If(self, _original_node: cst.If, updated_node: cst.If) -> cst.If | cst.FlattenSentinel[cst.BaseStatement]:
         """Handle if statements specially."""
         new_statements = []
 
@@ -225,10 +230,11 @@ class CallExtractorAndReplacer(cst.CSTTransformer):
     """
 
     def __init__(self, start_counter=1):
+        super().__init__()
         self.extracted_calls: list[tuple[str, cst.Call]] = []
         self.counter = start_counter
 
-    def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.BaseExpression:
+    def leave_Call(self, _original_node: cst.Call, updated_node: cst.Call) -> cst.BaseExpression:
         if isinstance(updated_node.func, cst.Attribute):
             var_name = f"attr_{self.counter}"
             self.counter += 1
@@ -246,6 +252,7 @@ class InitBodyTransformer(cst.CSTTransformer):
     """
 
     def __init__(self):
+        super().__init__()
         self.state_dict_entries = []
         self.other_statements = []
 
@@ -258,15 +265,14 @@ class InitBodyTransformer(cst.CSTTransformer):
 
                     self.state_dict_entries.append(cst.DictElement(key=cst.SimpleString(f"'{key}'"), value=value))
                     return cst.RemoveFromParent()
-            elif isinstance(stmt, cst.Assign):
-                if len(stmt.targets) == 1:
-                    target = stmt.targets[0].target
-                    if m.matches(target, m.Attribute(value=m.Name("self"))):
-                        key = target.attr.value
-                        value = stmt.value
+            elif isinstance(stmt, cst.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0].target
+                if m.matches(target, m.Attribute(value=m.Name("self"))):
+                    key = target.attr.value
+                    value = stmt.value
 
-                        self.state_dict_entries.append(cst.DictElement(key=cst.SimpleString(f"'{key}'"), value=value))
-                        return cst.RemoveFromParent()
+                    self.state_dict_entries.append(cst.DictElement(key=cst.SimpleString(f"'{key}'"), value=value))
+                    return cst.RemoveFromParent()
 
         self.other_statements.append(updated_node)
         return updated_node
@@ -294,6 +300,7 @@ class EntityTypeReplacer(cst.CSTTransformer):
     """
 
     def __init__(self, entity_keys: dict[str, str], entity_init_params: dict[str, dict[str, str]]):
+        super().__init__()
         self.entity_keys = entity_keys
         self.entity_init_params = entity_init_params
 
@@ -305,7 +312,7 @@ class EntityTypeReplacer(cst.CSTTransformer):
             return init_params[key_field]
         return None
 
-    def leave_Annotation(self, original_node, updated_node):
+    def leave_Annotation(self, _original_node, updated_node):
         ann = updated_node.annotation
 
         # Simple type: `item: Item` or `-> Item`

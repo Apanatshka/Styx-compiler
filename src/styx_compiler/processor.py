@@ -12,8 +12,8 @@ class FunctionProcessor:
         class_name: str,
         entities: dict[str, str],
         self_attr_types: dict[str, str],
-        entity_keys: dict[str, str] = None,
-        entity_init_params: dict[str, list[str]] = None,
+        entity_keys: dict[str, str] | None = None,
+        entity_init_params: dict[str, list[str]] | None = None,
     ):
         self.original_func = original_func
         self.class_name = class_name
@@ -41,14 +41,18 @@ class FunctionProcessor:
                 ann = param.annotation.annotation
                 if isinstance(ann, cst.Name):
                     self.local_types[param.name.value] = ann.value
-                elif isinstance(ann, cst.Subscript) and isinstance(ann.value, cst.Name):
-                    if ann.value.value in ("list", "List", "set", "Set"):
-                        if ann.slice and len(ann.slice) == 1:
-                            inner = ann.slice[0].slice
-                            if isinstance(inner, cst.Index) and isinstance(inner.value, cst.Name):
-                                element_type = inner.value.value
-                                if element_type in self.entities:
-                                    self.local_collection_element_types[param.name.value] = element_type
+                elif (
+                    isinstance(ann, cst.Subscript)
+                    and isinstance(ann.value, cst.Name)
+                    and ann.value.value in ("list", "List", "set", "Set")
+                    and ann.slice
+                    and len(ann.slice) == 1
+                ):
+                    inner = ann.slice[0].slice
+                    if isinstance(inner, cst.Index) and isinstance(inner.value, cst.Name):
+                        element_type = inner.value.value
+                        if element_type in self.entities:
+                            self.local_collection_element_types[param.name.value] = element_type
 
     def process(self) -> list[cst.FunctionDef]:
         """
@@ -60,7 +64,7 @@ class FunctionProcessor:
         modified = self.original_func.with_changes(body=cst.IndentedBlock(body=new_body))
         # Sort by step number so output is step_2, step_3, ...
         self.generated_functions.sort(key=lambda f: int(f.name.value.rsplit("_", 1)[-1]))
-        return [modified] + self.generated_functions
+        return [modified, *self.generated_functions]
 
     def _split_body(self, body: list, loop_context=None) -> list:
         """
@@ -87,10 +91,10 @@ class FunctionProcessor:
         # No remote calls found
         if loop_context:
             # Loop mode: direct continuation back to loop step (same entity)
-            loop_step_name, op_name, _ = loop_context
+            loop_step_name, _op_name, _ = loop_context
             put_state = cst.parse_statement("ctx.put(state)")
             direct_call = self._create_direct_continuation_call(loop_step_name)
-            return body + [put_state] + [direct_call]
+            return [*body, put_state, direct_call]
         return body
 
     def _handle_remote_call(self, body: list, i: int, loop_context=None) -> list:
@@ -178,7 +182,7 @@ class FunctionProcessor:
 
         if if_stmt.orelse is not None or (if_branch_dispatches and post_if):
             return [new_if]
-        return [new_if] + post_if
+        return [new_if, *post_if]
 
     def _parse_loop_iter(self, iter_node):
         """Returns (start_expr, bound_expr, is_range). Supports range() and collection iteration."""
@@ -238,11 +242,10 @@ class FunctionProcessor:
         loop_var_type = None
         if isinstance(for_stmt.target, cst.Name):
             loop_var_name = for_stmt.target.value
-            if not is_range:
-                if isinstance(for_stmt.iter, cst.Name):
-                    element_type = self.local_collection_element_types.get(for_stmt.iter.value)
-                    if element_type:
-                        loop_var_type = element_type
+            if not is_range and isinstance(for_stmt.iter, cst.Name):
+                element_type = self.local_collection_element_types.get(for_stmt.iter.value)
+                if element_type:
+                    loop_var_type = element_type
 
         # Generate assignment for the loop var and increment
         state_idx_access = cst.Subscript(
@@ -302,14 +305,14 @@ class FunctionProcessor:
         if_block = cst.If(
             test=loop_condition,
             body=cst.IndentedBlock(body=post_loop_body),
-            orelse=cst.Else(body=cst.IndentedBlock(body=[var_assign, inc_idx] + loop_body_processed)),
+            orelse=cst.Else(body=cst.IndentedBlock(body=[var_assign, inc_idx, *loop_body_processed])),
         )
-        loop_step_body = restore_block + [if_block]
+        loop_step_body = [*restore_block, if_block]
 
         cont_func = self._create_continuation(loop_step_name, loop_step_body, "placeholder_return")
         self.generated_functions.append(cont_func)
 
-        return pre_loop + [init_iter, put_state] + [direct_call]
+        return [*pre_loop, init_iter, put_state, direct_call]
 
     def _create_direct_continuation_call(self, func_name: str):
         """
@@ -362,12 +365,10 @@ class FunctionProcessor:
                     if isinstance(stmt.orelse, cst.Else):
                         if self._any_remote_call(list(stmt.orelse.body.body)):
                             return True
-                    elif isinstance(stmt.orelse, cst.If):
-                        if self._any_remote_call([stmt.orelse]):
-                            return True
-            if isinstance(stmt, cst.For):
-                if self._for_contains_remote_call(stmt):
-                    return True
+                    elif isinstance(stmt.orelse, cst.If) and self._any_remote_call([stmt.orelse]):
+                        return True
+            if isinstance(stmt, cst.For) and self._for_contains_remote_call(stmt):
+                return True
         return False
 
     def _if_contains_remote_call(self, node: cst.If) -> bool:
@@ -378,9 +379,8 @@ class FunctionProcessor:
             if isinstance(node.orelse, cst.Else):
                 if self._any_remote_call(list(node.orelse.body.body)):
                     return True
-            elif isinstance(node.orelse, cst.If):
-                if self._if_contains_remote_call(node.orelse):
-                    return True
+            elif isinstance(node.orelse, cst.If) and self._if_contains_remote_call(node.orelse):
+                return True
         return False
 
     def _for_contains_remote_call(self, node: cst.For) -> bool:
@@ -399,16 +399,19 @@ class FunctionProcessor:
         for stmt in node.body.body:
             if isinstance(stmt, cst.SimpleStatementLine):
                 for el in stmt.body:
-                    if isinstance(el, cst.Assign) and isinstance(el.value, cst.Subscript):
-                        if isinstance(el.value.value, cst.Name):
-                            collection_name = el.value.value.value
-                            element_type = self.local_collection_element_types.get(collection_name)
-                            if element_type and element_type in self.entities:
-                                for target in el.targets:
-                                    if isinstance(target.target, cst.Name):
-                                        var_name = target.target.value
-                                        temp_types[var_name] = element_type
-                                        self.local_types[var_name] = element_type
+                    if (
+                        isinstance(el, cst.Assign)
+                        and isinstance(el.value, cst.Subscript)
+                        and isinstance(el.value.value, cst.Name)
+                    ):
+                        collection_name = el.value.value.value
+                        element_type = self.local_collection_element_types.get(collection_name)
+                        if element_type and element_type in self.entities:
+                            for target in el.targets:
+                                if isinstance(target.target, cst.Name):
+                                    var_name = target.target.value
+                                    temp_types[var_name] = element_type
+                                    self.local_types[var_name] = element_type
 
         result = self._any_remote_call(list(node.body.body))
 
@@ -429,7 +432,8 @@ class FunctionProcessor:
             target_var = "placeholder_return"
             call_node = element.value
         else:
-            raise ValueError(f"Unexpected element: {type(element)}")
+            msg = f"Unexpected element: {type(element)}"
+            raise ValueError(msg)
 
         if isinstance(call_node.func, cst.Name):
             receiver = call_node.func
@@ -438,7 +442,8 @@ class FunctionProcessor:
             receiver = call_node.func.value
             remote_method = call_node.func.attr.value
         else:
-            raise ValueError(f"Unsupported call type: {type(call_node.func)}")
+            msg = f"Unsupported call type: {type(call_node.func)}"
+            raise ValueError(msg)
 
         return target_var, call_node, receiver, remote_method
 
@@ -509,10 +514,9 @@ class FunctionProcessor:
                 return var_type in self.entities
 
             # Case 3: self attribute (self.item.get_price())
-            if isinstance(base, cst.Attribute) and isinstance(base.value, cst.Name):
-                if base.value.value == "self":
-                    attr_type = self.self_attr_types.get(base.attr.value)
-                    return attr_type in self.entities
+            if isinstance(base, cst.Attribute) and isinstance(base.value, cst.Name) and base.value.value == "self":
+                attr_type = self.self_attr_types.get(base.attr.value)
+                return attr_type in self.entities
 
         return False
 
@@ -529,11 +533,14 @@ class FunctionProcessor:
                 return self.entities[name_val]
 
         # Case: self.item.method() -> receiver is cst.Attribute
-        if isinstance(receiver, cst.Attribute):
-            if isinstance(receiver.value, cst.Name) and receiver.value.value == "self":
-                attr_name = receiver.attr.value
-                attr_type = self.self_attr_types.get(attr_name)
-                return self.entities.get(attr_type, attr_type)
+        if (
+            isinstance(receiver, cst.Attribute)
+            and isinstance(receiver.value, cst.Name)
+            and receiver.value.value == "self"
+        ):
+            attr_name = receiver.attr.value
+            attr_type = self.self_attr_types.get(attr_name)
+            return self.entities.get(attr_type, attr_type)
 
         return self.entities.get(self.class_name, "unknown_operator")
 
@@ -681,7 +688,7 @@ class FunctionProcessor:
             )
         )
 
-        return [get_state] + restore_statements
+        return [get_state, *restore_statements]
 
     def _create_continuation(self, name, body, target_var):
         """Create a continuation function"""

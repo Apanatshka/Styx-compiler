@@ -1,7 +1,5 @@
-
 @entity
 class Item:
-
     class OutOfStock(Exception):
         pass
 
@@ -17,12 +15,12 @@ class Item:
         return self.stock
 
     def update_stock(self, amount: int) -> bool:
-        if (self.stock + amount) < 0:  
+        if (self.stock + amount) < 0:
             raise OutOfStock("Not enough stock to update.")
-        
+
         self.stock += amount
         return True
-    
+
     def test_stack(self, user: User, amount: int) -> bool:
         user.buy_item(amount, self.item_name)
         return True
@@ -33,7 +31,6 @@ class Item:
 
 @entity
 class User:
-
     class NotEnoughBalance(Exception):
         pass
 
@@ -47,7 +44,7 @@ class User:
 
     def get_balance(self) -> int:
         return self.balance
-    
+
     def get_items(self) -> list[Item]:
         return self.myitems
 
@@ -75,22 +72,21 @@ class User:
         return new_item
 
     def test_loop(self, amount, item: Item) -> bool:
-
         for i in range(amount):
             item.update_stock(-1)
-            
+
         return True
 
     def process_inventory(self, budget: int, items: list[Item]) -> bool:
         total_spent = 0
-        logging.warn(f"Processing inventory for user {self.username} with budget {budget}")
+        logging.warning(f"Processing inventory for user {self.username} with budget {budget}")
 
         for item in items:
-            logging.warn(f"Evaluating item {item}")
+            logging.warning(f"Evaluating item {item}")
             price = item.get_price()
-            logging.warn(f"Item price: {price}")
+            logging.warning(f"Item price: {price}")
             stock = item.get_stock()
-            logging.warn(f"Item stock: {stock}")
+            logging.warning(f"Item stock: {stock}")
 
             if price < budget:
                 if stock > 10:
@@ -101,7 +97,7 @@ class User:
                 item.update_stock(1)
 
             total_spent = total_spent + price
-            logging.warn(f"Total spent so far: {total_spent}")
+            logging.warning(f"Total spent so far: {total_spent}")
 
             self.myitems.append(item)
 

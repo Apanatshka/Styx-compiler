@@ -3,16 +3,17 @@ Main Styx transpiler implementation.
 """
 
 import libcst as cst
-from config import N_PARTITIONS
-from processor import FunctionProcessor
-from transformers import (
+
+from styx_compiler.config import N_PARTITIONS
+from styx_compiler.processor import FunctionProcessor
+from styx_compiler.transformers import (
     EntityTypeReplacer,
     InitBodyTransformer,
     RemoteCallLinearizer,
     ReturnHandlerTransformer,
     StateAccessTransformer,
 )
-from visitor import EntityDiscoveryVisitor
+from styx_compiler.visitor import EntityDiscoveryVisitor
 
 
 class StyxTransformer(cst.CSTTransformer):

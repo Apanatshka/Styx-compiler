@@ -156,3 +156,6 @@ _version.py
 
 # VS Code IDE project settings
 .vscode/
+
+# PyCharm project settings
+/.idea/

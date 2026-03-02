@@ -10,7 +10,7 @@ class EntityDiscoveryVisitor(cst.CSTVisitor):
     """
     Discovers entity classes marked with @entity decorator.
     """
-    
+
     def __init__(self):
         self.entities = {}
         self.entity_keys = {}
@@ -21,12 +21,14 @@ class EntityDiscoveryVisitor(cst.CSTVisitor):
             if m.matches(decorator, m.Decorator(decorator=m.Name("entity"))):
                 class_name = node.name.value
                 self.entities[class_name] = class_name.lower()
-                
+
                 for item in node.body.body:
                     # Find the __key__ method to identify the key field
                     if isinstance(item, cst.FunctionDef) and item.name.value == "__key__":
                         for stmt in item.body.body:
-                            if m.matches(stmt, m.SimpleStatementLine(body=[m.Return(value=m.Attribute(attr=m.Name()))])):
+                            if m.matches(
+                                stmt, m.SimpleStatementLine(body=[m.Return(value=m.Attribute(attr=m.Name()))])
+                            ):
                                 key_attr = stmt.body[0].value.attr.value
                                 self.entity_keys[class_name] = key_attr
 

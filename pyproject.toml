@@ -98,6 +98,9 @@ ignore = [
   "ISC001", # Conflicts with formatter
 ]
 pydocstyle.convention = "google"
+exclude = [
+  "examples/**.py"
+]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests can ignore a few extra rules

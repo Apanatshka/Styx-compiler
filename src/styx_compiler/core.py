@@ -269,8 +269,7 @@ class StyxTranspiler:
         return modified_tree.code
 
 
-# Main execution
-if __name__ == "__main__":
+def main() -> None:
     file_name = "user_item_2.py"
     input_file = "./examples/original/" + file_name
     output_file = "./examples/compiled/" + file_name
@@ -289,3 +288,8 @@ if __name__ == "__main__":
         f.write(output_code)
 
     print(f"Successfully transpiled '{input_file}' to '{output_file}'")
+
+
+# Main execution
+if __name__ == "__main__":
+    main()

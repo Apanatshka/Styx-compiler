@@ -1,0 +1,13 @@
+# Changes here will be overwritten by Copier
+_commit: v0.4.0
+_src_path: git+https://gitlab.ewi.tudelft.nl/reit/python-package-template
+email: S.A.Dimakos@student.tudelft.nl
+environment_manager: uv
+full_name: Alexandros Dimakos
+host: github.com
+license: Apache
+min_python_version: '3.16'
+org: AlexDimakos
+project_name: styx-compiler
+project_short_description: Compiler for the Styx embedded DSL in Python
+url: https://github.com/AlexDimakos/styx-compiler

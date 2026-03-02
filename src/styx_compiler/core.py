@@ -3,82 +3,86 @@ Main Styx transpiler implementation.
 """
 
 import libcst as cst
-from typing import List, Dict, Union
-
 from config import N_PARTITIONS
-from visitor import EntityDiscoveryVisitor
-from transformers import (
-    ReturnHandlerTransformer,
-    RemoteCallLinearizer,
-    InitBodyTransformer,
-    StateAccessTransformer,
-    EntityTypeReplacer,
-)
 from processor import FunctionProcessor
+from transformers import (
+    EntityTypeReplacer,
+    InitBodyTransformer,
+    RemoteCallLinearizer,
+    ReturnHandlerTransformer,
+    StateAccessTransformer,
+)
+from visitor import EntityDiscoveryVisitor
 
 
 class StyxTransformer(cst.CSTTransformer):
     """
     Main transformer that processes entity classes and converts them to Styx operators.
     """
-    
-    def __init__(self, entities: Dict[str, str], entity_keys: Dict[str, str] = None, entity_init_params: Dict[str, List[str]] = None):
+
+    def __init__(
+        self,
+        entities: dict[str, str],
+        entity_keys: dict[str, str] = None,
+        entity_init_params: dict[str, list[str]] = None,
+    ):
         self.entities = entities
         self.entity_keys = entity_keys or {}
         self.entity_init_params = entity_init_params or {}
         self.current_operator = None
-        self.self_attr_types: Dict[str, str] = {}
+        self.self_attr_types: dict[str, str] = {}
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:
         if node.name.value in self.entities:
             self.current_operator = node.name.value
             self.self_attr_types = {}
-            return True 
-        return False 
+            return True
+        return False
 
     def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
         imports = [
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.operator import Operator").body[0]]),
-            cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.stateful_function import StatefulFunction").body[0]]),
+            cst.SimpleStatementLine(
+                body=[cst.parse_statement("from styx.common.stateful_function import StatefulFunction").body[0]]
+            ),
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.logging import logging").body[0]]),
-            cst.EmptyLine()
+            cst.EmptyLine(),
         ]
-        
+
         new_body = list(imports) + list(updated_node.body)
         return updated_node.with_changes(body=new_body)
 
-    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> Union[cst.ClassDef, cst.FlattenSentinel]:
+    def leave_ClassDef(
+        self, original_node: cst.ClassDef, updated_node: cst.ClassDef
+    ) -> cst.ClassDef | cst.FlattenSentinel:
         if original_node.name.value not in self.entities:
             return updated_node
 
         op_name = self.entities[original_node.name.value]
-        
+
         op_def_code = f"{op_name}_operator = Operator('{op_name}', n_partitions={N_PARTITIONS})"
         op_def_node = cst.parse_statement(op_def_code)
-        
+
         new_nodes = [op_def_node, cst.EmptyLine()]
-        
+
         for statement in updated_node.body.body:
-            if isinstance(statement, cst.FunctionDef):
+            if isinstance(statement, cst.FunctionDef) or isinstance(statement, cst.ClassDef):
                 new_nodes.append(statement)
                 new_nodes.append(cst.EmptyLine())
-            elif isinstance(statement, cst.ClassDef):
-                new_nodes.append(statement)
-                new_nodes.append(cst.EmptyLine())
-        
+
         return cst.FlattenSentinel(new_nodes)
 
-    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> Union[cst.FunctionDef, cst.FlattenSentinel]:
+    def leave_FunctionDef(
+        self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
+    ) -> cst.FunctionDef | cst.FlattenSentinel:
         func_name = original_node.name.value
-        
+
         if func_name == "__init__":
             return self.transform_init(updated_node)
-        elif func_name == "__key__":
+        if func_name == "__key__":
             return cst.RemoveFromParent()
-        else:
-            return self.transform_method(updated_node)
-        
-    
+        return self.transform_method(updated_node)
+
     def _scan_init_for_attr_types(self, node: cst.FunctionDef):
         # Param name → type
         param_types = {}
@@ -91,7 +95,6 @@ class StyxTransformer(cst.CSTTransformer):
                 continue
 
             for element in stmt.body:
-
                 # -------- AnnAssign (self.x: Type = ...)
                 if isinstance(element, cst.AnnAssign):
                     target = element.target
@@ -131,46 +134,33 @@ class StyxTransformer(cst.CSTTransformer):
                             if value.func.value in self.entities:
                                 self.self_attr_types[attr_name] = value.func.value
 
-
     def transform_init(self, node: cst.FunctionDef) -> cst.FunctionDef:
         self._scan_init_for_attr_types(node)
-        new_name = cst.Name(value="create") 
-        
-        ctx_param = cst.Param(
-            name=cst.Name("ctx"),
-            annotation=cst.Annotation(annotation=cst.Name("StatefulFunction"))
-        )
+        new_name = cst.Name(value="create")
+
+        ctx_param = cst.Param(name=cst.Name("ctx"), annotation=cst.Annotation(annotation=cst.Name("StatefulFunction")))
         reply_to_param = cst.Param(
             name=cst.Name("reply_to"),
             annotation=cst.Annotation(annotation=cst.Name("list")),
             default=cst.Name("None"),
         )
-        new_params = [ctx_param] + [p for p in node.params.params if p.name.value != 'self'] + [reply_to_param]
+        new_params = [ctx_param] + [p for p in node.params.params if p.name.value != "self"] + [reply_to_param]
 
         body_transformer = InitBodyTransformer()
         new_body = node.body.visit(body_transformer)
 
         get_state = cst.parse_statement("state = ctx.get()")
-        
+
         dict_node = cst.Dict(elements=body_transformer.state_dict_entries)
-        
+
         put_call = cst.SimpleStatementLine(
-            body=[
-                cst.Assign(
-                    targets=[
-                        cst.AssignTarget(
-                            target=cst.Name("state")
-                        )
-                    ],
-                    value=dict_node
-                )
-            ]
+            body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name("state"))], value=dict_node)]
         )
 
         put_state = cst.parse_statement("ctx.put(state)")
-        
+
         return_stmt = cst.parse_statement("return ctx.key")
-        
+
         new_block = new_body.with_changes(
             body=[get_state] + body_transformer.other_statements + [put_call, put_state, return_stmt]
         )
@@ -178,44 +168,41 @@ class StyxTransformer(cst.CSTTransformer):
         final_block = new_block.visit(reply_to_transformer)
 
         decorator_name = f"{self.entities[self.current_operator]}_operator"
-        decorator = cst.Decorator(
-            decorator=cst.Attribute(
-                value=cst.Name(decorator_name),
-                attr=cst.Name("register")
-            )
-        )
+        decorator = cst.Decorator(decorator=cst.Attribute(value=cst.Name(decorator_name), attr=cst.Name("register")))
 
         return node.with_changes(
             name=new_name,
             params=node.params.with_changes(params=new_params),
-            body=final_block, 
+            body=final_block,
             asynchronous=cst.Asynchronous(),
             decorators=[decorator],
         )
 
-    def transform_method(self, node: cst.FunctionDef) -> Union[cst.FunctionDef, cst.FlattenSentinel]:
+    def transform_method(self, node: cst.FunctionDef) -> cst.FunctionDef | cst.FlattenSentinel:
         # 1. Linearize
         linearizer = RemoteCallLinearizer()
         node = node.visit(linearizer)
 
         # 2. Process and Split
-        processor = FunctionProcessor(node, self.current_operator, self.entities, self.self_attr_types, self.entity_keys, self.entity_init_params)
+        processor = FunctionProcessor(
+            node, self.current_operator, self.entities, self.self_attr_types, self.entity_keys, self.entity_init_params
+        )
         new_functions = processor.process()
 
         # 3. Post-Process
         final_nodes = []
-        
+
         for func in new_functions:
             state_transformer = StateAccessTransformer()
             func = func.visit(state_transformer)
-            
+
             if func.name.value == node.name.value:
                 get_state = cst.parse_statement("state = ctx.get()")
                 func = func.with_changes(body=cst.IndentedBlock(body=[get_state] + list(func.body.body)))
-                
+
                 reply_to_transformer = ReturnHandlerTransformer()
                 func = func.visit(reply_to_transformer)
-                
+
                 func = self._finalize_original_signature(func)
             else:
                 # Apply Return Handler to continuations
@@ -229,17 +216,17 @@ class StyxTransformer(cst.CSTTransformer):
 
     def _finalize_original_signature(self, node):
         ctx_param = cst.Param(name=cst.Name("ctx"), annotation=cst.Annotation(cst.Name("StatefulFunction")))
-        reply_to_param = cst.Param(name=cst.Name("reply_to"), annotation=cst.Annotation(cst.Name("list")), default=cst.Name("None"))
-        
+        reply_to_param = cst.Param(
+            name=cst.Name("reply_to"), annotation=cst.Annotation(cst.Name("list")), default=cst.Name("None")
+        )
+
         new_params = [ctx_param] + [p for p in node.params.params if p.name.value != "self"] + [reply_to_param]
-        
+
         op_name = self.entities[self.current_operator] + "_operator"
         decorator = cst.Decorator(decorator=cst.Attribute(value=cst.Name(op_name), attr=cst.Name("register")))
-        
+
         return node.with_changes(
-            params=node.params.with_changes(params=new_params),
-            decorators=[decorator],
-            asynchronous=cst.Asynchronous()
+            params=node.params.with_changes(params=new_params), decorators=[decorator], asynchronous=cst.Asynchronous()
         )
 
 
@@ -247,16 +234,16 @@ class StyxTranspiler:
     """
     Main transpiler class that orchestrates the transformation process.
     """
-    
+
     def __init__(self, source_code: str):
         self.source_code = source_code
         self.cst_tree = cst.parse_module(source_code)
-        self.entities: Dict[str, str] = {}  
+        self.entities: dict[str, str] = {}
 
     def run(self) -> str:
         """
         Run the transpilation process.
-        
+
         Returns:
             str: The transpiled code
         """
@@ -288,7 +275,7 @@ if __name__ == "__main__":
     output_file = "./examples/compiled/" + file_name
 
     try:
-        with open(input_file, "r", encoding="utf-8") as f:
+        with open(input_file, encoding="utf-8") as f:
             code = f.read()
     except FileNotFoundError:
         print(f"Error: The file '{input_file}' was not found.")
@@ -299,5 +286,5 @@ if __name__ == "__main__":
 
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(output_code)
-        
+
     print(f"Successfully transpiled '{input_file}' to '{output_file}'")

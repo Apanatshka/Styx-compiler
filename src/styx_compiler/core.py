@@ -219,7 +219,7 @@ class StyxTransformer(cst.CSTTransformer):
 
         return cst.FlattenSentinel(final_nodes)
 
-    def _finalize_original_signature(self, node):
+    def _finalize_original_signature(self, node: FunctionDef):
         ctx_param = cst.Param(name=cst.Name("ctx"), annotation=cst.Annotation(cst.Name("StatefulFunction")))
         reply_to_param = cst.Param(
             name=cst.Name("reply_to"), annotation=cst.Annotation(cst.Name("list")), default=cst.Name("None")
@@ -244,6 +244,8 @@ class StyxTranspiler:
         self.source_code = source_code
         self.cst_tree = cst.parse_module(source_code)
         self.entities: dict[str, str] = {}
+        self.entity_keys: dict = {}
+        self.entity_init_params: dict = {}
 
     def run(self) -> str:
         """

@@ -3,7 +3,7 @@ Styx Transpiler Package
 
 A transpiler for converting synchronous code with @entity decorators
 into asynchronous stateful functions.
-"""  # noqa: E501, RUF100
+"""
 
 from __future__ import annotations
 

@@ -195,8 +195,8 @@ class StatementLinearizer(cst.CSTTransformer):
             if should_collapse:
                 extractor.extracted_calls.pop()
                 new_stmt = new_stmt.with_changes(value=last_extracted_call)
-            else:
-                self.counter = extractor.counter
+            
+            self.counter = extractor.counter
             
             for var_name, call in extractor.extracted_calls:
                 assignment = cst.SimpleStatementLine(
@@ -245,15 +245,27 @@ class CallExtractorAndReplacer(cst.CSTTransformer):
     """
     
     def __init__(self, start_counter=1):
-        self.extracted_calls: List[Tuple[str, cst.Call]] = []
+        self.extracted_calls: List[Tuple[str, cst.BaseExpression]] = []
         self.counter = start_counter
         
     def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.BaseExpression:
         if isinstance(updated_node.func, cst.Attribute):
+            receiver = updated_node.func.value
+            new_func = updated_node.func
+            
+            if not isinstance(receiver, cst.Name):
+                receiver_var_name = f"attr_{self.counter}"
+                self.counter += 1
+                self.extracted_calls.append((receiver_var_name, receiver))
+                
+                new_func = new_func.with_changes(value=cst.Name(receiver_var_name))
+                
+            new_call = updated_node.with_changes(func=new_func)
+            
             var_name = f"attr_{self.counter}"
             self.counter += 1
             
-            self.extracted_calls.append((var_name, updated_node))
+            self.extracted_calls.append((var_name, new_call))
             
             return cst.Name(var_name)
         
@@ -298,17 +310,42 @@ class InitBodyTransformer(cst.CSTTransformer):
 
 class StateAccessTransformer(cst.CSTTransformer):
     """
-    Transforms self.attribute access to state['attribute'] dictionary access.
+    Transforms:
+    1. self.attribute -> state['attribute']
+    2. self           -> ctx.key
     """
     
     def leave_Attribute(self, original_node, updated_node):
+        # Handles self.attribute -> state['attribute']
         if m.matches(original_node, m.Attribute(value=m.Name("self"))):
             return cst.Subscript(
                 value=cst.Name("state"),
                 slice=[
-                    cst.SubscriptElement(slice=cst.Index(value=cst.SimpleString(f"'{original_node.attr.value}'")))
+                    cst.SubscriptElement(
+                        slice=cst.Index(value=cst.SimpleString(f"'{original_node.attr.value}'"))
+                    )
                 ]
             )
+        return updated_node
+
+    def leave_Name(self, original_node, updated_node):
+        # Handles standalone 'self' -> 'ctx.key'
+        if m.matches(original_node, m.Name("self")):
+            return cst.Attribute(
+                value=cst.Name("ctx"),
+                attr=cst.Name("key")
+            )
+        return updated_node
+
+
+class AnnotationNameReplacer(cst.CSTTransformer):
+    def __init__(self, get_key_type_func):
+        self.get_key_type = get_key_type_func
+
+    def leave_Name(self, original_node, updated_node):
+        replacement = self.get_key_type(original_node.value)
+        if replacement:
+            return updated_node.with_changes(value=replacement)
         return updated_node
 
 
@@ -316,7 +353,7 @@ class EntityTypeReplacer(cst.CSTTransformer):
     """
     Replaces entity type references in annotations with the key's type.
     e.g., `item: Item` -> `item: str`, `-> Item` -> `-> str`
-    Also handles: `items: list[Item]` -> `items: list[str]`
+    Also handles: `items: list[Item]` -> `items: list[str]`, `list[list[Item]]` -> `list[list[str]]`
     """
 
     def __init__(self, entity_keys: Dict[str, str], entity_init_params: Dict[str, Dict[str, str]]):
@@ -332,24 +369,6 @@ class EntityTypeReplacer(cst.CSTTransformer):
         return None
 
     def leave_Annotation(self, original_node, updated_node):
-        ann = updated_node.annotation
-
-        # Simple type: `item: Item` or `-> Item`
-        if isinstance(ann, cst.Name):
-            replacement = self._get_key_type(ann.value)
-            if replacement:
-                return updated_node.with_changes(annotation=cst.Name(replacement))
-
-        # Subscript type: `items: list[Item]`
-        if isinstance(ann, cst.Subscript) and ann.slice and len(ann.slice) == 1:
-            inner = ann.slice[0].slice
-            if isinstance(inner, cst.Index) and isinstance(inner.value, cst.Name):
-                replacement = self._get_key_type(inner.value.value)
-                if replacement:
-                    new_slice = [cst.SubscriptElement(
-                        slice=cst.Index(value=cst.Name(replacement))
-                    )]
-                    new_ann = ann.with_changes(slice=new_slice)
-                    return updated_node.with_changes(annotation=new_ann)
-
-        return updated_node
+        replacer = AnnotationNameReplacer(self._get_key_type)
+        new_ann = updated_node.annotation.visit(replacer)
+        return updated_node.with_changes(annotation=new_ann)

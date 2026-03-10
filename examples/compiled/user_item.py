@@ -1,13 +1,13 @@
-
 from styx.common.operator import Operator
 from styx.common.stateful_function import StatefulFunction
 from styx.common.logging import logging
 
-item_operator = Operator('item', n_partitions=4)
 
-
+class NotEnoughBalance(Exception):
+    pass
 class OutOfStock(Exception):
     pass
+item_operator = Operator('item', n_partitions=4)
 
 
 @item_operator.register
@@ -65,8 +65,8 @@ async def test_stack(ctx: StatefulFunction, user: str, amount: int, reply_to: li
     state = ctx.get()
     if reply_to is None:
         reply_to = []
-    reply_to.append({'op_name': 'item', 'fun': 'test_stack_step_2', 'id': ctx.key, 'context': {'user': user, 'amount': amount}})
-    ctx.call_remote_async(operator_name = 'user', function_name = 'buy_item', key = user, params = (amount, state['item_name'], reply_to))
+    reply_to.append({'op_name': 'item', 'fun': 'test_stack_step_2', 'id': ctx.key, 'context': {'amount': amount, 'user': user}})
+    ctx.call_remote_async(operator_name = 'user', function_name = 'buy_item', key = user, params = (amount, ctx.key, reply_to))
 
 @item_operator.register
 async def test_stack_step_2(ctx: StatefulFunction, params, placeholder_return = None, reply_to: list = None):
@@ -80,10 +80,6 @@ async def test_stack_step_2(ctx: StatefulFunction, params, placeholder_return = 
         return True
 
 user_operator = Operator('user', n_partitions=4)
-
-
-class NotEnoughBalance(Exception):
-    pass
 
 
 @user_operator.register
@@ -152,7 +148,7 @@ async def buy_item_step_2(ctx: StatefulFunction, params, attr_1 = None, reply_to
         raise NotEnoughBalance("Not enough balance to buy the item.")
     if reply_to is None:
         reply_to = []
-    reply_to.append({'op_name': 'user', 'fun': 'buy_item_step_3', 'id': ctx.key, 'context': {'total_price': total_price, 'amount': amount, 'attr_1': attr_1, 'item': item}})
+    reply_to.append({'op_name': 'user', 'fun': 'buy_item_step_3', 'id': ctx.key, 'context': {'amount': amount, 'total_price': total_price, 'attr_1': attr_1, 'item': item}})
     ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = (-amount, reply_to))
 
 @user_operator.register
@@ -223,13 +219,13 @@ async def test_loop_step_2(ctx: StatefulFunction, params, placeholder_return = N
         state['__loop_index_1'] += 1
         if reply_to is None:
             reply_to = []
-        reply_to.append({'op_name': 'user', 'fun': 'test_loop_step_2', 'id': ctx.key, 'context': {'i': i, 'amount': amount, 'item': item}})
+        reply_to.append({'op_name': 'user', 'fun': 'test_loop_step_2', 'id': ctx.key, 'context': {'amount': amount, 'i': i, 'item': item}})
         ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = (-1, reply_to))
     ctx.put(state)
 
 
 @user_operator.register
-async def process_inventory(ctx: StatefulFunction, budget: int, items: list[str], reply_to: list = None) -> bool:
+async def process_inventory(ctx: StatefulFunction, budget: int, items: list[str], reply_to: list = None) -> str:
     state = ctx.get()
     total_spent = 0
     logging.warn(f"Processing inventory for user {state['username']} with budget {budget}")
@@ -257,7 +253,7 @@ async def process_inventory_step_2(ctx: StatefulFunction, params, placeholder_re
         logging.warn(f"Evaluating item {item}")
         if reply_to is None:
             reply_to = []
-        reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_3', 'id': ctx.key, 'context': {'budget': budget, 'total_spent': total_spent, 'items': items, 'item': item}})
+        reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_3', 'id': ctx.key, 'context': {'item': item, 'items': items, 'budget': budget, 'total_spent': total_spent}})
         ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = (reply_to,))
     ctx.put(state)
 
@@ -268,7 +264,7 @@ async def process_inventory_step_3(ctx: StatefulFunction, params, price = None, 
     logging.warn(f"Item price: {price}")
     if reply_to is None:
         reply_to = []
-    reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_4', 'id': ctx.key, 'context': {'budget': budget, 'total_spent': total_spent, 'price': price, 'items': items, 'item': item}})
+    reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_4', 'id': ctx.key, 'context': {'items': items, 'budget': budget, 'item': item, 'total_spent': total_spent, 'price': price}})
     ctx.call_remote_async(operator_name = 'item', function_name = 'get_stock', key = item, params = (reply_to,))
 
 @user_operator.register
@@ -281,12 +277,12 @@ async def process_inventory_step_4(ctx: StatefulFunction, params, stock = None, 
         if stock > 10:
             if reply_to is None:
                 reply_to = []
-            reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_5', 'id': ctx.key, 'context': {'budget': budget, 'total_spent': total_spent, 'price': price, 'stock': stock, 'items': items, 'item': item}})
+            reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_5', 'id': ctx.key, 'context': {'items': items, 'budget': budget, 'item': item, 'stock': stock, 'total_spent': total_spent, 'price': price}})
             ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = (-5, reply_to))
         elif stock > 0:
             if reply_to is None:
                 reply_to = []
-            reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_6', 'id': ctx.key, 'context': {'budget': budget, 'total_spent': total_spent, 'price': price, 'items': items, 'item': item, 'stock': stock}})
+            reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_6', 'id': ctx.key, 'context': {'stock': stock, 'items': items, 'budget': budget, 'total_spent': total_spent, 'price': price, 'item': item}})
             ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = (-1, reply_to))
         else:
             total_spent = total_spent + price
@@ -297,7 +293,7 @@ async def process_inventory_step_4(ctx: StatefulFunction, params, stock = None, 
     else:
         if reply_to is None:
             reply_to = []
-        reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_7', 'id': ctx.key, 'context': {'budget': budget, 'total_spent': total_spent, 'price': price, 'items': items, 'item': item, 'stock': stock}})
+        reply_to.append({'op_name': 'user', 'fun': 'process_inventory_step_7', 'id': ctx.key, 'context': {'stock': stock, 'items': items, 'budget': budget, 'total_spent': total_spent, 'price': price, 'item': item}})
         ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = (1, reply_to))
 
 @user_operator.register
@@ -332,7 +328,7 @@ async def process_inventory_step_7(ctx: StatefulFunction, params, placeholder_re
 
 
 @user_operator.register
-async def nested_loop_test(ctx: StatefulFunction, amount: int, items: list[str], reply_to: list = None) -> bool:
+async def nested_loop_test(ctx: StatefulFunction, amount: int, items: list[str], reply_to: list = None) -> str:
     state = ctx.get()
     total = 0
     state['__loop_index_1'] = 0
@@ -358,7 +354,7 @@ async def nested_loop_test_step_2(ctx: StatefulFunction, params, placeholder_ret
         state['__loop_index_1'] += 1
         if reply_to is None:
             reply_to = []
-        reply_to.append({'op_name': 'user', 'fun': 'nested_loop_test_step_3', 'id': ctx.key, 'context': {'total': total, 'amount': amount, 'items': items, 'item': item}})
+        reply_to.append({'op_name': 'user', 'fun': 'nested_loop_test_step_3', 'id': ctx.key, 'context': {'amount': amount, 'item': item, 'items': items, 'total': total}})
         ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = (reply_to,))
     ctx.put(state)
 
@@ -384,7 +380,7 @@ async def nested_loop_test_step_4(ctx: StatefulFunction, params, placeholder_ret
         state['__loop_index_2'] += 1
         if reply_to is None:
             reply_to = []
-        reply_to.append({'op_name': 'user', 'fun': 'nested_loop_test_step_4', 'id': ctx.key, 'context': {'price': price, 'amount': amount, 'items': items, 'i': i, 'total': total, 'item': item}})
+        reply_to.append({'op_name': 'user', 'fun': 'nested_loop_test_step_4', 'id': ctx.key, 'context': {'total': total, 'items': items, 'amount': amount, 'price': price, 'i': i, 'item': item}})
         ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = (-1, reply_to))
     ctx.put(state)
 

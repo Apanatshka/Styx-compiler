@@ -2,8 +2,13 @@
 Main Styx transpiler implementation.
 """
 
+import tempfile
+from pathlib import Path
 import libcst as cst
 from typing import List, Dict, Union
+import mypy.api
+
+from libcst_mypy import MypyTypeInferenceProvider
 
 from config import N_PARTITIONS
 from visitor import EntityDiscoveryVisitor
@@ -22,12 +27,12 @@ class StyxTransformer(cst.CSTTransformer):
     Main transformer that processes entity classes and converts them to Styx operators.
     """
     
-    def __init__(self, entities: Dict[str, str], entity_keys: Dict[str, str] = None, entity_init_params: Dict[str, List[str]] = None):
+    def __init__(self, entities: Dict[str, str], metadata: Dict, entity_keys: Dict[str, str] = None, entity_init_params: Dict[str, List[str]] = None):
         self.entities = entities
+        self.metadata = metadata
         self.entity_keys = entity_keys or {}
         self.entity_init_params = entity_init_params or {}
         self.current_operator = None
-        self.self_attr_types: Dict[str, str] = {}
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:
         if node.name.value in self.entities:
@@ -44,7 +49,17 @@ class StyxTransformer(cst.CSTTransformer):
             cst.EmptyLine()
         ]
         
-        new_body = list(imports) + list(updated_node.body)
+        # Filter out stuff for mytype (entity function, logging class) from body
+        stub_names = {"entity", "logging"}
+        filtered_body = [
+            stmt for stmt in updated_node.body
+            if not (
+                (isinstance(stmt, cst.FunctionDef) and stmt.name.value in stub_names) or
+                (isinstance(stmt, cst.ClassDef) and stmt.name.value in stub_names)
+            )
+        ]
+        
+        new_body = list(imports) + filtered_body
         return updated_node.with_changes(body=new_body)
 
     def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> Union[cst.ClassDef, cst.FlattenSentinel]:
@@ -69,6 +84,9 @@ class StyxTransformer(cst.CSTTransformer):
         return cst.FlattenSentinel(new_nodes)
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> Union[cst.FunctionDef, cst.FlattenSentinel]:
+        if self.current_operator is None:
+            return updated_node
+
         func_name = original_node.name.value
         
         if func_name == "__init__":
@@ -76,64 +94,10 @@ class StyxTransformer(cst.CSTTransformer):
         elif func_name == "__key__":
             return cst.RemoveFromParent()
         else:
-            return self.transform_method(updated_node)
+            return self.transform_method(original_node, updated_node)
         
     
-    def _scan_init_for_attr_types(self, node: cst.FunctionDef):
-        # Param name → type
-        param_types = {}
-        for p in node.params.params:
-            if p.annotation and isinstance(p.annotation.annotation, cst.Name):
-                param_types[p.name.value] = p.annotation.annotation.value
-
-        for stmt in node.body.body:
-            if not isinstance(stmt, cst.SimpleStatementLine):
-                continue
-
-            for element in stmt.body:
-
-                # -------- AnnAssign (self.x: Type = ...)
-                if isinstance(element, cst.AnnAssign):
-                    target = element.target
-
-                    if (
-                        isinstance(target, cst.Attribute)
-                        and isinstance(target.value, cst.Name)
-                        and target.value.value == "self"
-                    ):
-                        attr_name = target.attr.value
-
-                        if isinstance(element.annotation.annotation, cst.Name):
-                            type_name = element.annotation.annotation.value
-                            if type_name in self.entities:
-                                self.self_attr_types[attr_name] = type_name
-
-                # -------- Assign (self.x = ...)
-                elif isinstance(element, cst.Assign):
-                    target = element.targets[0].target
-                    value = element.value
-
-                    if (
-                        isinstance(target, cst.Attribute)
-                        and isinstance(target.value, cst.Name)
-                        and target.value.value == "self"
-                    ):
-                        attr_name = target.attr.value
-
-                        # self.x = param
-                        if isinstance(value, cst.Name):
-                            rhs_type = param_types.get(value.value)
-                            if rhs_type in self.entities:
-                                self.self_attr_types[attr_name] = rhs_type
-
-                        # self.x = Entity(...)
-                        elif isinstance(value, cst.Call) and isinstance(value.func, cst.Name):
-                            if value.func.value in self.entities:
-                                self.self_attr_types[attr_name] = value.func.value
-
-
     def transform_init(self, node: cst.FunctionDef) -> cst.FunctionDef:
-        self._scan_init_for_attr_types(node)
         new_name = cst.Name(value="create") 
         
         ctx_param = cst.Param(
@@ -193,30 +157,26 @@ class StyxTransformer(cst.CSTTransformer):
             decorators=[decorator],
         )
 
-    def transform_method(self, node: cst.FunctionDef) -> Union[cst.FunctionDef, cst.FlattenSentinel]:
-        # 1. Linearize
-        linearizer = RemoteCallLinearizer()
-        node = node.visit(linearizer)
-
-        # 2. Process and Split
-        processor = FunctionProcessor(node, self.current_operator, self.entities, self.self_attr_types, self.entity_keys, self.entity_init_params)
+    def transform_method(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> Union[cst.FunctionDef, cst.FlattenSentinel]:
+        # Split funcition at remote calls
+        processor = FunctionProcessor(original_node, self.current_operator, self.entities, self.metadata, self.entity_keys, self.entity_init_params)
         new_functions = processor.process()
 
-        # 3. Post-Process
+        # Post-Process
         final_nodes = []
         
         for func in new_functions:
             state_transformer = StateAccessTransformer()
             func = func.visit(state_transformer)
             
-            if func.name.value == node.name.value:
+            if func.name.value == original_node.name.value:
                 get_state = cst.parse_statement("state = ctx.get()")
                 func = func.with_changes(body=cst.IndentedBlock(body=[get_state] + list(func.body.body)))
                 
                 reply_to_transformer = ReturnHandlerTransformer()
                 func = func.visit(reply_to_transformer)
                 
-                func = self._finalize_original_signature(func)
+                func = self._finalize_original_signature(func, updated_node)
             else:
                 # Apply Return Handler to continuations
                 reply_to_transformer = ReturnHandlerTransformer()
@@ -227,11 +187,11 @@ class StyxTransformer(cst.CSTTransformer):
 
         return cst.FlattenSentinel(final_nodes)
 
-    def _finalize_original_signature(self, node):
+    def _finalize_original_signature(self, node: cst.FunctionDef, reference_node: cst.FunctionDef):
         ctx_param = cst.Param(name=cst.Name("ctx"), annotation=cst.Annotation(cst.Name("StatefulFunction")))
         reply_to_param = cst.Param(name=cst.Name("reply_to"), annotation=cst.Annotation(cst.Name("list")), default=cst.Name("None"))
         
-        new_params = [ctx_param] + [p for p in node.params.params if p.name.value != "self"] + [reply_to_param]
+        new_params = [ctx_param] + [p for p in reference_node.params.params if p.name.value != "self"] + [reply_to_param]
         
         op_name = self.entities[self.current_operator] + "_operator"
         decorator = cst.Decorator(decorator=cst.Attribute(value=cst.Name(op_name), attr=cst.Name("register")))
@@ -262,6 +222,7 @@ class StyxTranspiler:
         """
         print("--- Starting Transpilation ---")
 
+        # 1. Discover entities
         visitor = EntityDiscoveryVisitor()
         self.cst_tree.visit(visitor)
         self.entities = visitor.entities
@@ -271,14 +232,70 @@ class StyxTranspiler:
         print(f"Entity Keys: {self.entity_keys}")
         print(f"Entity Init Params: {self.entity_init_params}")
 
-        transformer = StyxTransformer(self.entities, self.entity_keys, self.entity_init_params)
-        modified_tree = self.cst_tree.visit(transformer)
+        # 2. Linearize
+        linearizer = RemoteCallLinearizer()
+        linearized_tree = self.cst_tree.visit(linearizer)
+        linearized_code = linearized_tree.code
 
-        # Replace entity type annotations with key types
+        # 3. Run mypy on the linearized code to get type metadata
+        module, metadata = self._resolve_types(linearized_code)
+        print(f"Mypy resolved {len(metadata)} type annotations")
+
+        # 4. Transform using the same node tree (metadata lookups match)
+        transformer = StyxTransformer(self.entities, metadata, self.entity_keys, self.entity_init_params)
+        modified_tree = module.visit(transformer)
+
+        # 5. Replace entity type annotations with key types
         type_replacer = EntityTypeReplacer(self.entity_keys, self.entity_init_params)
         modified_tree = modified_tree.visit(type_replacer)
 
         return modified_tree.code
+
+    def _resolve_types(self, source_code: str):
+        """
+        Run mypy on the source code and return (parsed_module, metadata_dict).
+        The metadata_dict maps cst.CSTNode -> MypyType.
+        """
+        # Prepend so mypy does not fail
+        stubs = (
+            "def entity(cls): return cls\n"
+            "class logging:\n"
+            "    @staticmethod\n"
+            "    def warn(msg): pass\n"
+        )
+        full_code = stubs + source_code
+
+        # Write to temp file for mypy to analyze
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
+            f.write(full_code)
+            tmp_path = Path(f.name)
+
+        try:
+            # Make sure the code is type correct
+            stdout, stderr, exit_code = mypy.api.run([str(tmp_path)])
+            if exit_code != 0:
+                clean_errs = stdout.replace(str(tmp_path), "source")
+                raise RuntimeError(f"Mypy Type Check Failed:\n{clean_errs}")
+
+            # Generate mypy cache for semantic analysis
+            cache = MypyTypeInferenceProvider.gen_cache(
+                root_path=tmp_path.parent,
+                paths=[str(tmp_path)],
+            )
+
+            # Parse the same code with MetadataWrapper and resolve types
+            module = cst.parse_module(full_code)
+            file_cache = cache.get(str(tmp_path))
+            wrapper = cst.metadata.MetadataWrapper(
+                module,
+                unsafe_skip_copy=True,
+                cache={MypyTypeInferenceProvider: file_cache},
+            )
+            metadata = wrapper.resolve(MypyTypeInferenceProvider)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        return wrapper.module, metadata
 
 
 # Main execution

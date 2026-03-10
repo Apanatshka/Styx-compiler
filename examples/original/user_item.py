@@ -1,9 +1,11 @@
 
+class NotEnoughBalance(Exception):
+    pass
+class OutOfStock(Exception):
+    pass
+
 @entity
 class Item:
-
-    class OutOfStock(Exception):
-        pass
 
     def __init__(self, item_name: str, price: int):
         self.item_name: str = item_name
@@ -24,7 +26,7 @@ class Item:
         return True
     
     def test_stack(self, user: User, amount: int) -> bool:
-        user.buy_item(amount, self.item_name)
+        user.buy_item(amount, self)
         return True
 
     def __key__(self):
@@ -33,9 +35,6 @@ class Item:
 
 @entity
 class User:
-
-    class NotEnoughBalance(Exception):
-        pass
 
     def __init__(self, username: str):
         self.username: str = username
@@ -81,7 +80,7 @@ class User:
             
         return True
 
-    def process_inventory(self, budget: int, items: list[Item]) -> bool:
+    def process_inventory(self, budget: int, items: list[Item]) -> str:
         total_spent = 0
         logging.warn(f"Processing inventory for user {self.username} with budget {budget}")
 
@@ -108,7 +107,7 @@ class User:
         self.balance -= total_spent
         return "New balance: " + str(self.balance)
 
-    def nested_loop_test(self, amount: int, items: list[Item]) -> bool:
+    def nested_loop_test(self, amount: int, items: list[Item]) -> str:
         total = 0
 
         for item in items:

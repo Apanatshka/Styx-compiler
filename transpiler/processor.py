@@ -450,28 +450,29 @@ class FunctionProcessor:
 
     def _get_entity_type(self, node) -> str:
         mypy_type = self.metadata.get(node)
-        
+
         if mypy_type is not None:
-            type_name = self._extract_type_name(mypy_type)
+            # Only check the outermost type - e.g. list[Item] gives 'list', not 'Item'
+            # This prevents list.append() / list.sort() from being treated as entity calls
+            type_name = self._extract_outermost_type_name(mypy_type)
             if type_name in self.entities:
                 return type_name
 
-        if isinstance(node, cst.Subscript):
-            return self._get_entity_type(node.value)
-            
         if isinstance(node, cst.Call) and isinstance(node.func, cst.Name):
             if node.func.value in self.entities:
                 return node.func.value
-                
+
         return None
 
-    def _extract_type_name(self, mypy_type) -> str:
-        """Extract the simple class name from a MypyType fullname."""
+    def _extract_outermost_type_name(self, mypy_type) -> str:
+        """Extract the outermost class name, ignoring generics.
+        e.g. 'builtins.list[module.Item]' -> 'list'
+             'test_tmp.Item' -> 'Item'
+        """
         fullname = mypy_type.fullname
-        # Handle generic types like list[module.Item] -> module.Item
+        # Drop generic part: 'builtins.list[module.Item]' -> 'builtins.list'
         if "[" in fullname:
-            fullname = fullname.split("[")[-1].split("]")[0]
-        # Get just the class name: "module.Item" -> "Item"
+            fullname = fullname.split("[")[0]
         return fullname.rsplit(".", 1)[-1]
     
     def _resolve_operator_name(self, receiver: cst.BaseExpression) -> str:

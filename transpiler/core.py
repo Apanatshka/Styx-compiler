@@ -22,6 +22,16 @@ from transformers import (
 from processor import FunctionProcessor
 
 
+def _uses_state(node: cst.CSTNode) -> bool:
+    """Recursively checks whether any Name('state') appears in the CST subtree."""
+    if isinstance(node, cst.Name) and node.value == "state":
+        return True
+    for child in node.children:
+        if _uses_state(child):
+            return True
+    return False
+
+
 class StyxTransformer(cst.CSTTransformer):
     """
     Main transformer that processes entity classes and converts them to Styx operators.
@@ -48,6 +58,36 @@ class StyxTransformer(cst.CSTTransformer):
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.logging import logging").body[0]]),
             cst.EmptyLine()
         ]
+
+        helpers_code = """
+def send_reply(ctx: StatefulFunction, reply_to: list, result):
+    if reply_to:
+        reply_info = reply_to.pop()
+        ctx.call_remote_async(
+            operator_name=reply_info["op_name"],
+            function_name=reply_info["fun"],
+            key=reply_info["id"],
+            params=(reply_info["context"], result, reply_to),
+        )
+    else:
+        return result
+
+
+def push_continuation(reply_to: list, op_name: str, fun: str, step_id: str, context: dict) -> list:
+    if reply_to is None:
+        reply_to = []
+    reply_to.append(
+        {
+            "op_name": op_name,
+            "fun": fun,
+            "id": step_id,
+            "context": context,
+        }
+    )
+    return reply_to
+"""
+        helpers_module = cst.parse_module(helpers_code)
+        helpers = list(helpers_module.body) + [cst.EmptyLine()]
         
         # Filter out stuff for mytype (entity function, logging class) from body
         stub_names = {"entity", "logging"}
@@ -59,7 +99,7 @@ class StyxTransformer(cst.CSTTransformer):
             )
         ]
         
-        new_body = list(imports) + filtered_body
+        new_body = list(imports) + helpers + filtered_body
         return updated_node.with_changes(body=new_body)
 
     def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> Union[cst.ClassDef, cst.FlattenSentinel]:
@@ -114,8 +154,6 @@ class StyxTransformer(cst.CSTTransformer):
         body_transformer = InitBodyTransformer()
         new_body = node.body.visit(body_transformer)
 
-        get_state = cst.parse_statement("state = ctx.get()")
-        
         dict_node = cst.Dict(elements=body_transformer.state_dict_entries)
         
         put_call = cst.SimpleStatementLine(
@@ -136,7 +174,7 @@ class StyxTransformer(cst.CSTTransformer):
         return_stmt = cst.parse_statement("return ctx.key")
         
         new_block = new_body.with_changes(
-            body=[get_state] + body_transformer.other_statements + [put_call, put_state, return_stmt]
+            body=body_transformer.other_statements + [put_call, put_state, return_stmt]
         )
         reply_to_transformer = ReturnHandlerTransformer()
         final_block = new_block.visit(reply_to_transformer)
@@ -168,19 +206,19 @@ class StyxTransformer(cst.CSTTransformer):
         for func in new_functions:
             state_transformer = StateAccessTransformer()
             func = func.visit(state_transformer)
-            
-            if func.name.value == original_node.name.value:
+
+            # Ensure any function that uses `state` loads it from ctx
+            if _uses_state(func):
                 get_state = cst.parse_statement("state = ctx.get()")
                 func = func.with_changes(body=cst.IndentedBlock(body=[get_state] + list(func.body.body)))
-                
-                reply_to_transformer = ReturnHandlerTransformer()
-                func = func.visit(reply_to_transformer)
-                
+
+            # Apply Return Handler to all functions
+            reply_to_transformer = ReturnHandlerTransformer()
+            func = func.visit(reply_to_transformer)
+
+            # Finalize original method signature only for the root function
+            if func.name.value == original_node.name.value:
                 func = self._finalize_original_signature(func, updated_node)
-            else:
-                # Apply Return Handler to continuations
-                reply_to_transformer = ReturnHandlerTransformer()
-                func = func.visit(reply_to_transformer)
 
             final_nodes.append(func)
             final_nodes.append(cst.EmptyLine())

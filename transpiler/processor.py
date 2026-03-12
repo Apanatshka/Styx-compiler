@@ -535,59 +535,12 @@ class FunctionProcessor:
         context_entries = [
             cst.DictElement(
                 key=cst.SimpleString(f"'{v}'"),
-                value=cst.Name(v)
+                value=cst.Name(v),
             )
             for v in self.defined_vars
         ]
 
         context_dict = cst.Dict(elements=context_entries)
-
-        # reply to the continuation
-        reply_info_dict = cst.Dict(elements=[
-            cst.DictElement(cst.SimpleString("'op_name'"), cst.SimpleString(f"'{reply_op_name}'")),
-            cst.DictElement(cst.SimpleString("'fun'"), cst.SimpleString(f"'{next_func_name}'")),
-            cst.DictElement(
-                key=cst.SimpleString("'id'"),
-                value=cst.Attribute(
-                    value=cst.Name("ctx"),
-                    attr=cst.Name("key"),
-                ),
-            ),
-            cst.DictElement(cst.SimpleString("'context'"), context_dict),
-        ])
-
-        init_reply_to = cst.If(
-            test=cst.Comparison(
-                left=cst.Name("reply_to"),
-                comparisons=[
-                    cst.ComparisonTarget(
-                        operator=cst.Is(),
-                        comparator=cst.Name("None")
-                    )
-                ],
-            ),
-            body=cst.IndentedBlock(
-                body=[
-                    cst.SimpleStatementLine(
-                        body=[
-                            cst.Assign(
-                                targets=[cst.AssignTarget(cst.Name("reply_to"))],
-                                value=cst.List(elements=[])
-                            )
-                        ]
-                    )
-                ]
-            )
-        )
-
-        push_reply_info = cst.SimpleStatementLine(
-            body=[cst.Expr(
-                value=cst.Call(
-                    func=cst.Attribute(value=cst.Name("reply_to"), attr=cst.Name("append")),
-                    args=[cst.Arg(value=reply_info_dict)]
-                )
-            )]
-        )
 
         # remote call becomes an async statement
         async_call = cst.SimpleStatementLine(
@@ -607,12 +560,33 @@ class FunctionProcessor:
         if next_func_name == "None":
             return [async_call]
 
-        return [init_reply_to, push_reply_info, async_call]
+        push_call = cst.SimpleStatementLine(
+            body=[
+                cst.Assign(
+                    targets=[cst.AssignTarget(target=cst.Name("reply_to"))],
+                    value=cst.Call(
+                        func=cst.Name("push_continuation"),
+                        args=[
+                            cst.Arg(value=cst.Name("reply_to")),
+                            cst.Arg(value=cst.SimpleString(f"'{reply_op_name}'")),
+                            cst.Arg(value=cst.SimpleString(f"'{next_func_name}'")),
+                            cst.Arg(
+                                value=cst.Attribute(
+                                    value=cst.Name("ctx"),
+                                    attr=cst.Name("key"),
+                                )
+                            ),
+                            cst.Arg(value=context_dict),
+                        ],
+                    ),
+                )
+            ]
+        )
+
+        return [push_call, async_call]
 
     def _create_restore_block(self):
         """Restore locals from params dict"""
-        get_state = cst.parse_statement("state = ctx.get()")
-
         restore_statements = []
 
         sorted_vars = sorted(self.defined_vars)
@@ -654,7 +628,7 @@ class FunctionProcessor:
             )
 
 
-        return [get_state] + restore_statements
+        return restore_statements
 
     def _create_continuation(self, name, body, target_var):
         """Create a continuation function"""

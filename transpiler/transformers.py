@@ -82,49 +82,23 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
             
         ret_val = return_node.value if return_node.value else cst.Name("None")
 
-        pop_reply = cst.parse_statement("reply_info = reply_to.pop()")
-        
-        params_tuple = cst.Tuple(
-            elements=[
-                cst.Element(value=cst.parse_expression('reply_info["context"]')),
-                cst.Element(value=ret_val),
-                cst.Element(value=cst.Name("reply_to")),
+        # Generate: return send_reply(ctx, reply_to, result)
+        send_reply_call = cst.Call(
+            func=cst.Name("send_reply"),
+            args=[
+                cst.Arg(value=cst.Name("ctx")),
+                cst.Arg(value=cst.Name("reply_to")),
+                cst.Arg(value=ret_val),
             ]
         )
 
-        call_remote = cst.Call(
-            func=cst.parse_expression("ctx.call_remote_async"),
-            args=[
-                cst.Arg(keyword=cst.Name("operator_name"), value=cst.parse_expression('reply_info["op_name"]')),
-                cst.Arg(keyword=cst.Name("function_name"), value=cst.parse_expression('reply_info["fun"]')),
-                cst.Arg(keyword=cst.Name("key"), value=cst.parse_expression('reply_info["id"]')),
-                cst.Arg(keyword=cst.Name("params"), value=params_tuple)
-            ]
-        )
-        
-        if_block = cst.IndentedBlock(
-            body=[
-                cst.SimpleStatementLine(body=[pop_reply.body[0]]),
-                cst.SimpleStatementLine(body=[cst.Expr(value=call_remote)]),
-                cst.SimpleStatementLine(body=[cst.Return(value=None)])
-            ]
-        )
-        
-        else_block = cst.Else(
-            body=cst.IndentedBlock(
-                body=[updated_node]
-            )
-        )
-        
-        if_stmt = cst.If(
-            test=cst.Name("reply_to"),
-            body=if_block,
-            orelse=else_block
+        res_stmt = cst.SimpleStatementLine(
+            body=[cst.Return(value=send_reply_call)]
         )
 
         put_state = cst.parse_statement("ctx.put(state)")
 
-        res = cst.FlattenSentinel([put_state, if_stmt]) if self.state_dirty_stack[-1] else if_stmt
+        res = cst.FlattenSentinel([put_state, res_stmt]) if self.state_dirty_stack[-1] else res_stmt
         
         return res
 

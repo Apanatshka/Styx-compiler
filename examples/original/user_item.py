@@ -96,10 +96,11 @@ class User:
         return "Bulk purchase complete. Remaining balance: " + str(self.balance)
 
 
-    def tempfunc(self) -> int:
-        return self.get_balance()
+    def tempfunc(self):
+        self.get_balance()
 
     def get_first_item(self) -> Item:
+        self.myitems.append(Item("test", 10))
     
         return self.myitems[0]
 

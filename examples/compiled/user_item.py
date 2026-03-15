@@ -114,7 +114,7 @@ async def add_balance(ctx: StatefulFunction, amount: int, reply_to: list = None)
 
 @user_operator.register
 async def buy_item(ctx: StatefulFunction, amount: int, item: str, reply_to: list = None) -> bool:
-    reply_to = push_continuation(ctx, reply_to, 'user', 'buy_item_step_2', ctx.key, {'amount': amount, 'item': item})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'buy_item_step_2', ctx.key, {'item': item, 'amount': amount})
     ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = (reply_to,))
 
 @user_operator.register
@@ -126,7 +126,7 @@ async def buy_item_step_2(ctx: StatefulFunction, func_context, attr_1 = None, re
 
     if state['balance'] < total_price:
         raise NotEnoughBalance("Not enough balance to buy the item.")
-    reply_to = push_continuation(ctx, reply_to, 'user', 'buy_item_step_3', ctx.key, {'attr_1': attr_1, 'amount': amount, 'total_price': total_price, 'item': item})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'buy_item_step_3', ctx.key, {'item': item, 'amount': amount, 'attr_1': attr_1, 'total_price': total_price})
     ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = (-amount, reply_to))
 
 @user_operator.register
@@ -161,9 +161,9 @@ async def bulk_purchase_with_tiers_step_2(ctx: StatefulFunction, func_context, p
         __loop_index_1 += 1
         item = cart[index]
         requested_amount = quantities[index]
-        reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_3', ctx.key, {'quantities': quantities, '__loop_index_1': __loop_index_1, 'requested_amount': requested_amount, 'cart': cart, 'index': index, 'total_cost': total_cost, 'item': item})
+        reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_3', ctx.key, {'quantities': quantities, 'total_cost': total_cost, 'requested_amount': requested_amount, 'item': item, 'cart': cart, 'index': index, '__loop_index_1': __loop_index_1})
+        ctx.put(state)
         ctx.call_remote_async(operator_name = 'item', function_name = 'get_stock', key = item, params = (reply_to,))
-    ctx.put(state)
 
 @user_operator.register
 async def bulk_purchase_with_tiers_step_3(ctx: StatefulFunction, func_context, attr_8 = None, reply_to: list = None):
@@ -189,23 +189,21 @@ async def bulk_purchase_with_tiers_step_4(ctx: StatefulFunction, func_context, p
         
         if (total_cost + current_item_cost) > state['balance']:
             raise NotEnoughBalance("Cannot afford the entire cart.")
-            ctx.put(state)
-            ctx.call_remote_async(operator_name = 'user', function_name = 'bulk_purchase_with_tiers_step_2', key = ctx.key, params = ({'__loop_index_1': __loop_index_1, '__loop_index_2': __loop_index_2, 'attr_8': attr_8, 'cart': cart, 'current_item_cost': current_item_cost, 'index': index, 'item': item, 'quantities': quantities, 'requested_amount': requested_amount, 'total_cost': total_cost}, None, reply_to))
         else:
-            reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_5', ctx.key, {'__loop_index_2': __loop_index_2, 'quantities': quantities, 'current_item_cost': current_item_cost, 'attr_8': attr_8, '__loop_index_1': __loop_index_1, 'requested_amount': requested_amount, 'cart': cart, 'index': index, 'total_cost': total_cost, 'item': item})
+            reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_5', ctx.key, {'quantities': quantities, 'total_cost': total_cost, 'requested_amount': requested_amount, 'item': item, 'cart': cart, 'index': index, 'current_item_cost': current_item_cost, 'attr_8': attr_8, '__loop_index_2': __loop_index_2, '__loop_index_1': __loop_index_1})
             ctx.call_remote_async(operator_name = 'item', function_name = 'update_stock', key = item, params = (-requested_amount, reply_to))
     else:
         unit = __loop_index_2
         __loop_index_2 += 1
         
         if unit > 50:
-            reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_6', ctx.key, {'__loop_index_2': __loop_index_2, 'quantities': quantities, 'current_item_cost': current_item_cost, 'attr_8': attr_8, 'unit': unit, '__loop_index_1': __loop_index_1, 'requested_amount': requested_amount, 'cart': cart, 'index': index, 'total_cost': total_cost, 'item': item})
+            reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_6', ctx.key, {'quantities': quantities, 'total_cost': total_cost, 'requested_amount': requested_amount, 'item': item, 'cart': cart, 'index': index, 'current_item_cost': current_item_cost, 'attr_8': attr_8, '__loop_index_2': __loop_index_2, 'unit': unit, '__loop_index_1': __loop_index_1})
             ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = (reply_to,))
         elif unit > 10:
-            reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_7', ctx.key, {'__loop_index_2': __loop_index_2, 'quantities': quantities, 'current_item_cost': current_item_cost, 'attr_8': attr_8, 'unit': unit, '__loop_index_1': __loop_index_1, 'requested_amount': requested_amount, 'cart': cart, 'index': index, 'total_cost': total_cost, 'item': item})
+            reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_7', ctx.key, {'quantities': quantities, 'total_cost': total_cost, 'requested_amount': requested_amount, 'item': item, 'cart': cart, 'index': index, 'current_item_cost': current_item_cost, 'attr_8': attr_8, '__loop_index_2': __loop_index_2, 'unit': unit, '__loop_index_1': __loop_index_1})
             ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = (reply_to,))
         else:
-            reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_8', ctx.key, {'__loop_index_2': __loop_index_2, 'quantities': quantities, 'current_item_cost': current_item_cost, 'attr_8': attr_8, 'unit': unit, '__loop_index_1': __loop_index_1, 'requested_amount': requested_amount, 'cart': cart, 'index': index, 'total_cost': total_cost, 'item': item})
+            reply_to = push_continuation(ctx, reply_to, 'user', 'bulk_purchase_with_tiers_step_8', ctx.key, {'quantities': quantities, 'total_cost': total_cost, 'requested_amount': requested_amount, 'item': item, 'cart': cart, 'index': index, 'current_item_cost': current_item_cost, 'attr_8': attr_8, '__loop_index_2': __loop_index_2, 'unit': unit, '__loop_index_1': __loop_index_1})
             ctx.call_remote_async(operator_name = 'item', function_name = 'get_price', key = item, params = (reply_to,))
 
 @user_operator.register
@@ -218,6 +216,7 @@ async def bulk_purchase_with_tiers_step_5(ctx: StatefulFunction, func_context, p
     for copy in range(requested_amount):
         attr_5 = state['myitems']
         attr_5.append(item)
+    ctx.put(state)
     ctx.put(state)
     ctx.call_remote_async(operator_name = 'user', function_name = 'bulk_purchase_with_tiers_step_2', key = ctx.key, params = ({'__loop_index_1': __loop_index_1, '__loop_index_2': __loop_index_2, 'attr_5': attr_5, 'attr_8': attr_8, 'cart': cart, 'copy': copy, 'current_item_cost': current_item_cost, 'index': index, 'item': item, 'quantities': quantities, 'requested_amount': requested_amount, 'total_cost': total_cost}, None, reply_to))
 
@@ -251,18 +250,16 @@ async def bulk_purchase_with_tiers_step_8(ctx: StatefulFunction, func_context, a
 
 
 @user_operator.register
-async def tempfunc(ctx: StatefulFunction, reply_to: list = None) -> int:
-    reply_to = push_continuation(ctx, reply_to, 'user', 'tempfunc_step_2', ctx.key, {})
+async def tempfunc(ctx: StatefulFunction, reply_to: list = None):
     ctx.call_remote_async(operator_name = 'user', function_name = 'get_balance', key = ctx.key, params = (reply_to,))
-
-@user_operator.register
-async def tempfunc_step_2(ctx: StatefulFunction, func_context, attr_1 = None, reply_to: list = None):
-    return send_reply(ctx, reply_to, attr_1)
 
 
 @user_operator.register
 async def get_first_item(ctx: StatefulFunction, reply_to: list = None) -> str:
     state = ctx.get()
+    attr_1 = state['myitems']
+    attr_1.append(Item("test", 10))
+    ctx.put(state)
     return send_reply(ctx, reply_to, state['myitems'][0])
 
 
@@ -270,7 +267,7 @@ async def get_first_item(ctx: StatefulFunction, reply_to: list = None) -> str:
 @user_operator.register
 async def type_test(ctx: StatefulFunction, hard: list[list[dict[str, int]]], easy: list[list[str]], reply_to: list = None) -> str:
     temp = easy[0][0]
-    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_2', ctx.key, {'hard': hard, 'temp': temp, 'easy': easy})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_2', ctx.key, {'hard': hard, 'easy': easy, 'temp': temp})
     ctx.call_remote_async(operator_name = 'item', function_name = 'get_stock', key = temp, params = (reply_to,))
 
 @user_operator.register
@@ -280,7 +277,7 @@ async def type_test_step_2(ctx: StatefulFunction, func_context, placeholder_retu
     attr_2 = hard[0][0]
     attr_3 = attr_2.keys()
     attr_4 = list(attr_3)[0]
-    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_3', ctx.key, {'attr_4': attr_4, 'attr_3': attr_3, 'temp': temp, 'attr_2': attr_2, 'hard': hard, 'easy': easy})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_3', ctx.key, {'attr_4': attr_4, 'attr_2': attr_2, 'hard': hard, 'temp': temp, 'attr_3': attr_3, 'easy': easy})
     ctx.call_remote_async(operator_name = 'item', function_name = 'get_stock', key = attr_4, params = (reply_to,))
 
 @user_operator.register
@@ -288,21 +285,21 @@ async def type_test_step_3(ctx: StatefulFunction, func_context, placeholder_retu
     params = resolve_context(ctx, func_context)
     (attr_2, attr_3, attr_4, easy, hard, temp) = (params['attr_2'], params['attr_3'], params['attr_4'], params['easy'], params['hard'], params['temp'])
     temp3 = easy[0][0]
-    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_4', ctx.key, {'temp3': temp3, 'attr_4': attr_4, 'attr_3': attr_3, 'temp': temp, 'attr_2': attr_2, 'hard': hard, 'easy': easy})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_4', ctx.key, {'attr_4': attr_4, 'attr_2': attr_2, 'hard': hard, 'temp': temp, 'temp3': temp3, 'attr_3': attr_3, 'easy': easy})
     ctx.call_remote_async(operator_name = 'item', function_name = 'get_stock', key = temp3, params = (reply_to,))
 
 @user_operator.register
 async def type_test_step_4(ctx: StatefulFunction, func_context, placeholder_return = None, reply_to: list = None):
     params = resolve_context(ctx, func_context)
     (attr_2, attr_3, attr_4, easy, hard, temp, temp3) = (params['attr_2'], params['attr_3'], params['attr_4'], params['easy'], params['hard'], params['temp'], params['temp3'])
-    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_5', ctx.key, {'temp3': temp3, 'attr_4': attr_4, 'attr_3': attr_3, 'temp': temp, 'attr_2': attr_2, 'hard': hard, 'easy': easy})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_5', ctx.key, {'attr_4': attr_4, 'attr_2': attr_2, 'hard': hard, 'temp': temp, 'temp3': temp3, 'attr_3': attr_3, 'easy': easy})
     ctx.call_remote_async(operator_name = 'user', function_name = 'get_first_item', key = ctx.key, params = (reply_to,))
 
 @user_operator.register
 async def type_test_step_5(ctx: StatefulFunction, func_context, temp4 = None, reply_to: list = None):
     params = resolve_context(ctx, func_context)
     (attr_2, attr_3, attr_4, easy, hard, temp, temp3) = (params['attr_2'], params['attr_3'], params['attr_4'], params['easy'], params['hard'], params['temp'], params['temp3'])
-    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_6', ctx.key, {'temp3': temp3, 'temp4': temp4, 'attr_4': attr_4, 'attr_3': attr_3, 'temp': temp, 'attr_2': attr_2, 'hard': hard, 'easy': easy})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_6', ctx.key, {'attr_4': attr_4, 'attr_2': attr_2, 'hard': hard, 'temp': temp, 'temp3': temp3, 'attr_3': attr_3, 'temp4': temp4, 'easy': easy})
     ctx.call_remote_async(operator_name = 'item', function_name = 'get_stock', key = temp4, params = (reply_to,))
 
 @user_operator.register
@@ -311,7 +308,7 @@ async def type_test_step_6(ctx: StatefulFunction, func_context, placeholder_retu
     params = resolve_context(ctx, func_context)
     (attr_2, attr_3, attr_4, easy, hard, temp, temp3, temp4) = (params['attr_2'], params['attr_3'], params['attr_4'], params['easy'], params['hard'], params['temp'], params['temp3'], params['temp4'])
     attr_9 = state['myitems'][0]
-    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_7', ctx.key, {'temp3': temp3, 'temp4': temp4, 'attr_4': attr_4, 'attr_3': attr_3, 'temp': temp, 'attr_2': attr_2, 'attr_9': attr_9, 'hard': hard, 'easy': easy})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_7', ctx.key, {'attr_9': attr_9, 'attr_4': attr_4, 'attr_2': attr_2, 'hard': hard, 'temp': temp, 'temp3': temp3, 'attr_3': attr_3, 'temp4': temp4, 'easy': easy})
     ctx.call_remote_async(operator_name = 'item', function_name = 'get_stock', key = attr_9, params = (reply_to,))
 
 @user_operator.register
@@ -323,7 +320,7 @@ async def type_test_step_7(ctx: StatefulFunction, func_context, stock_val = None
     something.remote()
     lst = [state['myitems'][0], state['myitems'][1]]
     attr_12 = lst[0]
-    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_8', ctx.key, {'temp3': temp3, 'temp4': temp4, 'attr_4': attr_4, 'attr_3': attr_3, 'lst': lst, 'temp': temp, 'attr_2': attr_2, 'stock_val': stock_val, 'something': something, 'attr_9': attr_9, 'hard': hard, 'easy': easy, 'attr_12': attr_12})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_8', ctx.key, {'attr_9': attr_9, 'attr_4': attr_4, 'something': something, 'attr_2': attr_2, 'hard': hard, 'temp': temp, 'temp3': temp3, 'attr_3': attr_3, 'temp4': temp4, 'easy': easy, 'lst': lst, 'attr_12': attr_12, 'stock_val': stock_val})
     ctx.call_remote_async(operator_name = 'item', function_name = 'get_stock', key = attr_12, params = (reply_to,))
 
 @user_operator.register
@@ -333,7 +330,7 @@ async def type_test_step_8(ctx: StatefulFunction, func_context, stock = None, re
     (attr_12, attr_2, attr_3, attr_4, attr_9, easy, hard, lst, something, stock_val, temp, temp3, temp4) = (params['attr_12'], params['attr_2'], params['attr_3'], params['attr_4'], params['attr_9'], params['easy'], params['hard'], params['lst'], params['something'], params['stock_val'], params['temp'], params['temp3'], params['temp4'])
     something.remote()
     temp5 = state['myitems'][0]
-    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_9', ctx.key, {'temp3': temp3, 'temp4': temp4, 'attr_4': attr_4, 'attr_3': attr_3, 'lst': lst, 'temp': temp, 'temp5': temp5, 'attr_2': attr_2, 'stock_val': stock_val, 'something': something, 'attr_9': attr_9, 'hard': hard, 'stock': stock, 'easy': easy, 'attr_12': attr_12})
+    reply_to = push_continuation(ctx, reply_to, 'user', 'type_test_step_9', ctx.key, {'attr_9': attr_9, 'stock': stock, 'temp5': temp5, 'attr_4': attr_4, 'something': something, 'attr_2': attr_2, 'hard': hard, 'temp': temp, 'temp3': temp3, 'attr_3': attr_3, 'temp4': temp4, 'easy': easy, 'lst': lst, 'attr_12': attr_12, 'stock_val': stock_val})
     ctx.call_remote_async(operator_name = 'item', function_name = 'get_stock', key = temp5, params = (reply_to,))
 
 @user_operator.register

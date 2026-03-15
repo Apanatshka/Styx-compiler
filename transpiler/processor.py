@@ -69,6 +69,9 @@ class FunctionProcessor:
 
         # No remote calls found
         if loop_context:
+            # If body ends with a raise, skip unreachable continuation tail
+            if body and self._ends_with_raise(body):
+                return body
             # Loop mode: direct continuation back to loop step (same entity)
             loop_step_name, op_name, _ = loop_context
             put_state = cst.parse_statement("ctx.put(state)")
@@ -407,6 +410,15 @@ class FunctionProcessor:
                 self.defined_vars.add(stmt.target.value)
             for s in stmt.body.body:
                 self._track_vars(s)
+
+    def _ends_with_raise(self, body: List) -> bool:
+        """Check if the last statement is a raise (making any following code unreachable)."""
+        if not body:
+            return False
+        last = body[-1]
+        if isinstance(last, cst.SimpleStatementLine):
+            return any(isinstance(el, cst.Raise) for el in last.body)
+        return False
 
     def _is_remote_call(self, stmt):
         

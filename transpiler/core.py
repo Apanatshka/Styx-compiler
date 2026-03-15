@@ -53,6 +53,7 @@ class StyxTransformer(cst.CSTTransformer):
 
     def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
         imports = [
+            cst.SimpleStatementLine(body=[cst.parse_statement("import uuid").body[0]]),
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.operator import Operator").body[0]]),
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.stateful_function import StatefulFunction").body[0]]),
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.logging import logging").body[0]]),
@@ -73,7 +74,11 @@ def send_reply(ctx: StatefulFunction, reply_to: list, result):
         return result
 
 
-def push_continuation(reply_to: list, op_name: str, fun: str, step_id: str, context: dict) -> list:
+def push_continuation(ctx: StatefulFunction, reply_to: list, op_name: str, fun: str, step_id: str, context: dict) -> list:
+    context_dict = ctx.get_func_context()
+    continuation_id = str(uuid.uuid4())
+    context_dict[continuation_id] = context
+    ctx.put_func_context(context_dict)
     if reply_to is None:
         reply_to = []
     reply_to.append(
@@ -81,10 +86,20 @@ def push_continuation(reply_to: list, op_name: str, fun: str, step_id: str, cont
             "op_name": op_name,
             "fun": fun,
             "id": step_id,
-            "context": context,
+            "context": continuation_id,
         }
     )
     return reply_to
+
+
+def resolve_context(ctx: StatefulFunction, context_data) -> dict:
+    if isinstance(context_data, dict):
+        return context_data
+    
+    ctx_dict = ctx.get_func_context()
+    params = ctx_dict.pop(context_data)
+    ctx.put_func_context(ctx_dict)
+    return params
 """
         helpers_module = cst.parse_module(helpers_code)
         helpers = list(helpers_module.body) + [cst.EmptyLine()]
@@ -170,11 +185,13 @@ def push_continuation(reply_to: list, op_name: str, fun: str, step_id: str, cont
         )
 
         put_state = cst.parse_statement("ctx.put(state)")
+        put_func_state = cst.parse_statement("ctx.put_func_context({})")
+
         
         return_stmt = cst.parse_statement("return ctx.key")
         
         new_block = new_body.with_changes(
-            body=body_transformer.other_statements + [put_call, put_state, return_stmt]
+            body=body_transformer.other_statements + [put_call, put_state, put_func_state, return_stmt]
         )
         reply_to_transformer = ReturnHandlerTransformer()
         final_block = new_block.visit(reply_to_transformer)
@@ -338,7 +355,7 @@ class StyxTranspiler:
 
 # Main execution
 if __name__ == "__main__":
-    file_name = "user_item_2.py"
+    file_name = "user_item.py"
     input_file = "./examples/original/" + file_name
     output_file = "./examples/compiled/" + file_name
 

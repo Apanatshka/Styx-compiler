@@ -1,9 +1,9 @@
-
 class NotEnoughBalance(Exception):
     pass
+
 class OutOfStock(Exception):
     pass
-
+    
 @entity
 class Item:
 
@@ -24,14 +24,9 @@ class Item:
         
         self.stock += amount
         return True
-    
-    def test_stack(self, user: User, amount: int) -> bool:
-        user.buy_item(amount, self)
-        return True
 
     def __key__(self):
         return self.item_name
-
 
 @entity
 class User:
@@ -66,57 +61,86 @@ class User:
         self.myitems.append(item)
         return True
 
-    def create_user_item(self, name: str, price: int) -> Item:
-        new_item = Item(self.username + "_" + name, price)
+    def bulk_purchase_with_tiers(self, cart: list[Item], quantities: list[int]) -> str:
+        total_cost = 0
 
-        new_item.update_stock(1)
-
-        return new_item
-
-    def test_loop(self, amount, item: Item) -> bool:
-
-        for i in range(amount):
-            item.update_stock(-1)
+        for index in range(len(cart)):
+            item = cart[index]
+            requested_amount = quantities[index]
             
-        return True
-
-    def process_inventory(self, budget: int, items: list[Item]) -> str:
-        total_spent = 0
-        logging.warn(f"Processing inventory for user {self.username} with budget {budget}")
-
-        for item in items:
-            logging.warn(f"Evaluating item {item}")
-            price = item.get_price()
-            logging.warn(f"Item price: {price}")
-            stock = item.get_stock()
-            logging.warn(f"Item stock: {stock}")
-
-            if price < budget:
-                if stock > 10:
-                    item.update_stock(-5)
-                elif stock > 0:
-                    item.update_stock(-1)
+            if item.get_stock() >= requested_amount:
+                current_item_cost = 0
+                
+                for unit in range(1, requested_amount + 1):
+                    
+                    if unit > 50:
+                        current_item_cost = current_item_cost + int(item.get_price() * 0.8) 
+                    elif unit > 10:
+                        current_item_cost = current_item_cost + int(item.get_price() * 0.9) 
+                    else:
+                        current_item_cost = current_item_cost + item.get_price()
+                
+                if (total_cost + current_item_cost) > self.balance:
+                    raise NotEnoughBalance("Cannot afford the entire cart.")
+                else:
+                    item.update_stock(-requested_amount)
+                    total_cost = total_cost + current_item_cost
+                    
+                    for copy in range(requested_amount):
+                        self.myitems.append(item)
             else:
-                item.update_stock(1)
+                logging.warn(f"Skipping {item} due to low stock.")
+        
+        self.balance -= total_cost
+        
+        return "Bulk purchase complete. Remaining balance: " + str(self.balance)
 
-            total_spent = total_spent + price
-            logging.warn(f"Total spent so far: {total_spent}")
 
-            self.myitems.append(item)
+    def tempfunc(self) -> int:
+        return self.get_balance()
 
-        self.balance -= total_spent
-        return "New balance: " + str(self.balance)
+    def get_first_item(self) -> Item:
+    
+        return self.myitems[0]
 
-    def nested_loop_test(self, amount: int, items: list[Item]) -> str:
-        total = 0
 
-        for item in items:
-            price = item.get_price()
+    def type_test(self, hard: list[list[dict[Item, int]]], easy: list[list[Item]]) -> str:
+        temp = easy[0][0]
+        temp.get_stock()
 
-            for i in range(amount):
-                item.update_stock(-1)
+        list(hard[0][0].keys())[0].get_stock()
 
-            total = total + price
+        temp3 = easy[0][0]
+        temp3.get_stock()
 
-        self.balance -= total
-        return "New balance: " + str(self.balance)
+        temp4 = self.get_first_item()
+        temp4.get_stock()
+
+        stock_val = self.myitems[0].get_stock()
+
+        something = Something()
+        something.remote()
+
+        lst = [self.myitems[0], self.myitems[1]]
+        stock = lst[0].get_stock()
+
+        something.remote()
+
+        temp5 = self.myitems[0]
+        temp5.get_stock()
+
+
+
+        return "hello"
+
+
+class Something:
+    def __init__(self):
+        self.value = 10
+
+    def remote(self):
+        self.value = 20
+
+    def get_value(self) -> int:
+        return self.value
+

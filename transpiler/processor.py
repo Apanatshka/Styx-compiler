@@ -191,28 +191,21 @@ class FunctionProcessor:
 
         # Current loop level
         self.loop_iter_counter += 1
-        iter_key = f"'__loop_index_{self.loop_iter_counter}'"
+        iter_var_name = f"__loop_index_{self.loop_iter_counter}"
 
         self.split_counter += 1
         loop_step_name = f"{self.original_func.name.value}_step_{self.split_counter}"
 
         start_expr, bound_expr, is_range = self._parse_loop_iter(for_stmt.iter)
 
-        # Init block: state[iter_key] = start_expr
+        # Init block: iter_var_name = start_expr
         init_iter = cst.SimpleStatementLine(
             body=[cst.Assign(
-                targets=[cst.AssignTarget(
-                    target=cst.Subscript(
-                        value=cst.Name("state"),
-                        slice=[cst.SubscriptElement(
-                            slice=cst.Index(value=cst.SimpleString(iter_key))
-                        )]
-                    )
-                )],
+                targets=[cst.AssignTarget(target=cst.Name(iter_var_name))],
                 value=start_expr
             )]
         )
-        put_state = cst.parse_statement("ctx.put(state)")
+        self.defined_vars.add(iter_var_name)
 
         # Direct call to looping part of the function
         direct_call = self._create_direct_continuation_call(loop_step_name)
@@ -224,10 +217,7 @@ class FunctionProcessor:
             loop_var_name = for_stmt.target.value
 
         # Generate assignment for the loop var and increment
-        state_idx_access = cst.Subscript(
-            value=cst.Name("state"),
-            slice=[cst.SubscriptElement(slice=cst.Index(value=cst.SimpleString(iter_key)))]
-        )
+        state_idx_access = cst.Name(iter_var_name)
 
         if is_range:
             var_val = state_idx_access
@@ -269,7 +259,7 @@ class FunctionProcessor:
             self.defined_vars.add(loop_var_name)
 
         # Process loop body in loop mode
-        inner_loop_context = (loop_step_name, op_name, iter_key)
+        inner_loop_context = (loop_step_name, op_name, iter_var_name)
         loop_body_stmts = list(for_stmt.body.body)
         loop_body_processed = self._split_body(loop_body_stmts, inner_loop_context)
 
@@ -297,7 +287,7 @@ class FunctionProcessor:
         cont_func = self._create_continuation(loop_step_name, loop_step_body, "placeholder_return")
         self.generated_functions.append(cont_func)
 
-        return pre_loop + [init_iter, put_state] + [direct_call]
+        return pre_loop + [init_iter] + [direct_call]
 
 
     def _create_direct_continuation_call(self, func_name: str):
@@ -567,6 +557,7 @@ class FunctionProcessor:
                     value=cst.Call(
                         func=cst.Name("push_continuation"),
                         args=[
+                            cst.Arg(value=cst.Name("ctx")),
                             cst.Arg(value=cst.Name("reply_to")),
                             cst.Arg(value=cst.SimpleString(f"'{reply_op_name}'")),
                             cst.Arg(value=cst.SimpleString(f"'{next_func_name}'")),
@@ -591,6 +582,28 @@ class FunctionProcessor:
 
         sorted_vars = sorted(self.defined_vars)
 
+        if not sorted_vars:
+            return restore_statements
+
+        # params = resolve_context(ctx, func_context)
+        restore_statements.append(
+            cst.SimpleStatementLine(
+                body=[
+                    cst.Assign(
+                        targets=[cst.AssignTarget(target=cst.Name("params"))],
+                        value=cst.Call(
+                            func=cst.Name("resolve_context"),
+                            args=[
+                                cst.Arg(value=cst.Name("ctx")),
+                                cst.Arg(value=cst.Name("func_context")),
+                            ],
+                        ),
+                    )
+                ]
+            )
+        )
+
+        # (var1, var2, ...) = (params['var1'], params['var2'], ...)
         restore_statements.append(
             cst.SimpleStatementLine(
                 body=[
@@ -598,10 +611,7 @@ class FunctionProcessor:
                         targets=[
                             cst.AssignTarget(
                                 target=cst.Tuple(
-                                    elements=[
-                                        cst.Element(cst.Name(var))
-                                        for var in sorted_vars
-                                    ]
+                                    elements=[cst.Element(cst.Name(var)) for var in sorted_vars]
                                 )
                             )
                         ],
@@ -625,8 +635,7 @@ class FunctionProcessor:
                     )
                 ]
             )
-            )
-
+        )
 
         return restore_statements
 
@@ -645,7 +654,7 @@ class FunctionProcessor:
             name=cst.Name(name),
             params=cst.Parameters(params=[
                 cst.Param(name=cst.Name("ctx"), annotation=cst.Annotation(cst.Name("StatefulFunction"))),
-                cst.Param(name=cst.Name("params")),
+                cst.Param(name=cst.Name("func_context")),
                 cst.Param(name=cst.Name(target_var), default=cst.Name("None")),
                 reply_to_param,
             ]),

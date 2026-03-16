@@ -8,19 +8,20 @@ from pathlib import Path
 
 import libcst as cst
 import mypy.api
-from config import N_PARTITIONS
 from libcst import CSTNode, FlattenSentinel, FunctionDef, Module, RemovalSentinel
 from libcst_mypy import MypyTypeInferenceProvider
 from libcst_mypy.utils import MypyType
-from processor import FunctionProcessor
-from transformers import (
+
+from styx_compiler.config import N_PARTITIONS
+from styx_compiler.processor import FunctionProcessor
+from styx_compiler.transformers import (
     EntityTypeReplacer,
     InitBodyTransformer,
     RemoteCallLinearizer,
     ReturnHandlerTransformer,
     StateAccessTransformer,
 )
-from visitor import EntityDiscoveryVisitor
+from styx_compiler.visitor import EntityDiscoveryVisitor
 
 
 def _uses_state(node: cst.CSTNode) -> bool:

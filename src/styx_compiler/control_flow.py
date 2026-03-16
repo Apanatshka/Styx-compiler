@@ -50,27 +50,47 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
 
     def __init__(self):
         super().__init__()
-        self._cfg: dict[CfgNode, list[CfgNode]] = {}
+        self._cfg: dict[CfgNode, set[CfgNode]] = {}
         self._start_end: list[tuple[CfgNode, CfgNode]] = []
 
     def _edge(self, prev: list[CfgNode], cur: CfgNode) -> list[CfgNode]:
         for p in prev:
-            self._cfg[p].append(cur)
+            self._cfg[p].add(cur)
         return [cur]
 
     def _edges(self, prev: list[CfgNode], tos: list[CfgNode]) -> list[CfgNode]:
         for p in prev:
             for to in tos:
-                self._cfg[p].append(to)
+                self._cfg[p].add(to)
         return tos
 
     def _make_cfg_node(self, cst_node: cst.CSTNode, prev: list[CfgNode]) -> list[CfgNode]:
         cur = Node(self.get_metadata(IndexProvider, cst_node))
         return self._edge(prev, cur)
 
-    def _clean_up_cfg_ghosts(self, start: Start, end: End) -> None:
-        # TODO
-        pass
+    def _clean_up_cfg_ghosts(self, start: Start, _end: End) -> None:
+        seen: set[CfgNode] = set()
+        workstack: list[CfgNode] = [start]
+        seen.add(start)
+        while len(workstack) > 0:
+            node = workstack.pop()
+            ghost_workstack: list[Ghost] = []
+            for next_node in self._cfg[node]:
+                if isinstance(next_node, Ghost):
+                    ghost_workstack.append(next_node)
+                elif next_node not in seen:
+                    workstack.append(next_node)
+                    seen.add(next_node)
+            while len(ghost_workstack) > 0:
+                next_node = ghost_workstack.pop()
+                self._cfg[node].remove(next_node)
+                for next_next_node in self._cfg[next_node]:
+                    self._cfg[node].add(next_next_node)
+                    if isinstance(next_next_node, Ghost):
+                        ghost_workstack.append(next_next_node)
+                    elif next_node not in seen:
+                        workstack.append(next_node)
+                        seen.add(next_node)
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
         index = self.get_metadata(IndexProvider, node)

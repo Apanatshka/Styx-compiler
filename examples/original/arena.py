@@ -1,6 +1,6 @@
-
 class EntityIsDead(Exception):
     pass
+
 
 @entity
 class Monster:
@@ -17,10 +17,11 @@ class Monster:
         if self.hp <= 0:
             raise EntityIsDead("Monster is already dead.")
         self.hp -= amount
-        return self.hp <= 0  
+        return self.hp <= 0
 
     def get_combat_stats(self) -> dict:
         return {"damage": self.damage, "gold_drop": self.gold_drop}
+
 
 @entity
 class Player:
@@ -35,7 +36,7 @@ class Player:
 
     def receive_damage(self, amount: int) -> bool:
         self.hp -= amount
-        return self.hp <= 0 
+        return self.hp <= 0
 
     def heal_if_needed(self) -> str:
         if self.hp < 30 and self.potions > 0:
@@ -48,6 +49,7 @@ class Player:
         self.gold += amount
         return self.gold
 
+
 @entity
 class Arena:
     def __init__(self, arena_id: str):
@@ -59,16 +61,16 @@ class Arena:
 
     def run_gauntlet(self, player: Player, monsters: list[Monster]) -> str:
         total_gold_earned = 0
-        
+
         for i in range(len(monsters)):
             current_monster = monsters[i]
-            
+
             # 1. Get monster stats
             stats = current_monster.get_combat_stats()
-            
+
             # 2. Player attacks the monster first (deals flat 25 damage)
-            is_dead = current_monster.take_damage(25) 
-            
+            is_dead = current_monster.take_damage(25)
+
             if is_dead:
                 # 3. Loot the monster if it died
                 gold = stats["gold_drop"]
@@ -78,12 +80,12 @@ class Arena:
                 # 4. Monster survives and fights back
                 dmg = stats["damage"]
                 player_died = player.receive_damage(dmg)
-                
+
                 if player_died:
                     return "Player defeated at monster " + str(i) + ". Total gold: " + str(total_gold_earned)
-                
+
                 # 5. Player checks if they need to heal after taking a hit
                 player.heal_if_needed()
-        
+
         self.battles_fought += 1
         return "Gauntlet cleared! Total gold earned: " + str(total_gold_earned)

@@ -3,12 +3,15 @@ Main Styx transpiler implementation.
 """
 
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 import libcst as cst
 import mypy.api
 from config import N_PARTITIONS
+from libcst import CSTNode, FlattenSentinel, FunctionDef, Module, RemovalSentinel
 from libcst_mypy import MypyTypeInferenceProvider
+from libcst_mypy.utils import MypyType
 from processor import FunctionProcessor
 from transformers import (
     EntityTypeReplacer,
@@ -24,10 +27,7 @@ def _uses_state(node: cst.CSTNode) -> bool:
     """Recursively checks whether any Name('state') appears in the CST subtree."""
     if isinstance(node, cst.Name) and node.value == "state":
         return True
-    for child in node.children:
-        if _uses_state(child):
-            return True
-    return False
+    return any(_uses_state(child) for child in node.children)
 
 
 class StyxTransformer(cst.CSTTransformer):
@@ -38,15 +38,17 @@ class StyxTransformer(cst.CSTTransformer):
     def __init__(
         self,
         entities: dict[str, str],
-        metadata: dict,
-        entity_keys: dict[str, str] = None,
-        entity_init_params: dict[str, list[str]] = None,
+        metadata: Mapping,
+        entity_keys: dict[str, str] | None = None,
+        entity_init_params: dict[str, list[str]] | None = None,
     ):
+        super().__init__()
         self.entities = entities
         self.metadata = metadata
         self.entity_keys = entity_keys or {}
         self.entity_init_params = entity_init_params or {}
         self.current_operator = None
+        self.self_attr_types = None
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:
         if node.name.value in self.entities:
@@ -55,7 +57,7 @@ class StyxTransformer(cst.CSTTransformer):
             return True
         return False
 
-    def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
+    def leave_Module(self, _original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
         imports = [
             cst.SimpleStatementLine(body=[cst.parse_statement("import uuid").body[0]]),
             cst.SimpleStatementLine(body=[cst.parse_statement("from styx.common.operator import Operator").body[0]]),
@@ -80,7 +82,9 @@ def send_reply(ctx: StatefulFunction, reply_to: list, result):
         return result
 
 
-def push_continuation(ctx: StatefulFunction, reply_to: list, op_name: str, fun: str, step_id: str, context: dict) -> list:
+def push_continuation(
+    ctx: StatefulFunction, reply_to: list, op_name: str, fun: str, step_id: str, context: dict
+) -> list:
     context_dict = ctx.get_func_context()
     continuation_id = str(uuid.uuid4())
     context_dict[continuation_id] = context
@@ -101,14 +105,14 @@ def push_continuation(ctx: StatefulFunction, reply_to: list, op_name: str, fun: 
 def resolve_context(ctx: StatefulFunction, context_data) -> dict:
     if isinstance(context_data, dict):
         return context_data
-    
+
     ctx_dict = ctx.get_func_context()
     params = ctx_dict.pop(context_data)
     ctx.put_func_context(ctx_dict)
     return params
 """
         helpers_module = cst.parse_module(helpers_code)
-        helpers = list(helpers_module.body) + [cst.EmptyLine()]
+        helpers = [*list(helpers_module.body), cst.EmptyLine()]
 
         # Filter out stuff for mytype (entity function, logging class) from body
         stub_names = {"entity", "logging"}
@@ -138,7 +142,7 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
         new_nodes = [op_def_node, cst.EmptyLine()]
 
         for statement in updated_node.body.body:
-            if isinstance(statement, cst.FunctionDef) or isinstance(statement, cst.ClassDef):
+            if isinstance(statement, (cst.FunctionDef, cst.ClassDef)):
                 new_nodes.append(statement)
                 new_nodes.append(cst.EmptyLine())
 
@@ -146,7 +150,7 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
 
     def leave_FunctionDef(
         self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
-    ) -> cst.FunctionDef | cst.FlattenSentinel:
+    ) -> FunctionDef | RemovalSentinel | FlattenSentinel:
         if self.current_operator is None:
             return updated_node
 
@@ -184,7 +188,7 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
         return_stmt = cst.parse_statement("return ctx.key")
 
         new_block = new_body.with_changes(
-            body=body_transformer.other_statements + [put_call, put_state, put_func_state, return_stmt]
+            body=[*body_transformer.other_statements, put_call, put_state, put_func_state, return_stmt]
         )
         reply_to_transformer = ReturnHandlerTransformer()
         final_block = new_block.visit(reply_to_transformer)
@@ -203,7 +207,7 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
     def transform_method(
         self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
     ) -> cst.FunctionDef | cst.FlattenSentinel:
-        # Split funcition at remote calls
+        # Split function at remote calls
         processor = FunctionProcessor(
             original_node,
             self.current_operator,
@@ -219,22 +223,24 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
 
         for func in new_functions:
             state_transformer = StateAccessTransformer()
-            func = func.visit(state_transformer)
+            transformed_func = func.visit(state_transformer)
 
             # Ensure any function that uses `state` loads it from ctx
-            if _uses_state(func):
+            if _uses_state(transformed_func):
                 get_state = cst.parse_statement("state = ctx.get()")
-                func = func.with_changes(body=cst.IndentedBlock(body=[get_state] + list(func.body.body)))
+                transformed_func = transformed_func.with_changes(
+                    body=cst.IndentedBlock(body=[get_state, *list(transformed_func.body.body)])
+                )
 
             # Apply Return Handler to all functions
             reply_to_transformer = ReturnHandlerTransformer()
-            func = func.visit(reply_to_transformer)
+            transformed_func = transformed_func.visit(reply_to_transformer)
 
             # Finalize original method signature only for the root function
-            if func.name.value == original_node.name.value:
-                func = self._finalize_original_signature(func, updated_node)
+            if transformed_func.name.value == original_node.name.value:
+                transformed_func = self._finalize_original_signature(transformed_func, updated_node)
 
-            final_nodes.append(func)
+            final_nodes.append(transformed_func)
             final_nodes.append(cst.EmptyLine())
 
         return cst.FlattenSentinel(final_nodes)
@@ -266,6 +272,8 @@ class StyxTranspiler:
         self.source_code = source_code
         self.cst_tree = cst.parse_module(source_code)
         self.entities: dict[str, str] = {}
+        self.entity_keys = None
+        self.entity_init_params = None
 
     def run(self) -> str:
         """
@@ -292,7 +300,7 @@ class StyxTranspiler:
         linearized_code = linearized_tree.code
 
         # 3. Run mypy on the linearized code to get type metadata
-        module, metadata = self._resolve_types(linearized_code)
+        module, metadata = StyxTranspiler._resolve_types(linearized_code)
         print(f"Mypy resolved {len(metadata)} type annotations")
 
         # 4. Transform using the same node tree (metadata lookups match)
@@ -305,7 +313,8 @@ class StyxTranspiler:
 
         return modified_tree.code
 
-    def _resolve_types(self, source_code: str):
+    @staticmethod
+    def _resolve_types(source_code: str) -> tuple[Module, Mapping[CSTNode, MypyType]]:
         """
         Run mypy on the source code and return (parsed_module, metadata_dict).
         The metadata_dict maps cst.CSTNode -> MypyType.
@@ -321,10 +330,11 @@ class StyxTranspiler:
 
         try:
             # Make sure the code is type correct
-            stdout, stderr, exit_code = mypy.api.run([str(tmp_path)])
+            stdout, _stderr, exit_code = mypy.api.run([str(tmp_path)])
             if exit_code != 0:
                 clean_errs = stdout.replace(str(tmp_path), "source")
-                raise RuntimeError(f"Mypy Type Check Failed:\n{clean_errs}")
+                msg = f"Mypy Type Check Failed:\n{clean_errs}"
+                raise RuntimeError(msg)
 
             # Generate mypy cache for semantic analysis
             cache = MypyTypeInferenceProvider.gen_cache(

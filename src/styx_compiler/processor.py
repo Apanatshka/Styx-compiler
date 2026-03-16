@@ -11,9 +11,9 @@ class FunctionProcessor:
         original_func: cst.FunctionDef,
         class_name: str,
         entities: dict[str, str],
-        self_attr_types: dict[str, str],
-        entity_keys: dict[str, str] | None = None,
-        entity_init_params: dict[str, list[str]] | None = None,
+        metadata: dict,
+        entity_keys: dict[str, str] = None,
+        entity_init_params: dict[str, list[str]] = None,
     ):
         self.original_func = original_func
         self.class_name = class_name
@@ -23,36 +23,20 @@ class FunctionProcessor:
         self.entity_keys = entity_keys or {}
         self.entity_init_params = entity_init_params or {}
 
+        # Mypy metadata: cst.CSTNode -> MypyType
+        self.metadata = metadata
+
         self.split_counter = 1
         self.loop_iter_counter = 0
         self.generated_functions: list[cst.FunctionDef] = []
 
         # Track local variables to save/restore
-        self.self_attr_types = self_attr_types  # Entity variables
-        self.defined_vars = set()  # Local variables
-        self.local_types = {}  # Local variable types
-        self.local_collection_element_types = {}  # e.g. {"items": "Item"}
+        self.defined_vars = set()
 
-        # Pre-scan arguments to define types and initial variables
+        # Pre-scan arguments to define variables
         for param in original_func.params.params:
             if param.name.value != "self" and param.name.value != "ctx":
                 self.defined_vars.add(param.name.value)
-            if param.annotation:
-                ann = param.annotation.annotation
-                if isinstance(ann, cst.Name):
-                    self.local_types[param.name.value] = ann.value
-                elif (
-                    isinstance(ann, cst.Subscript)
-                    and isinstance(ann.value, cst.Name)
-                    and ann.value.value in ("list", "List", "set", "Set")
-                    and ann.slice
-                    and len(ann.slice) == 1
-                ):
-                    inner = ann.slice[0].slice
-                    if isinstance(inner, cst.Index) and isinstance(inner.value, cst.Name):
-                        element_type = inner.value.value
-                        if element_type in self.entities:
-                            self.local_collection_element_types[param.name.value] = element_type
 
     def process(self) -> list[cst.FunctionDef]:
         """
@@ -64,7 +48,7 @@ class FunctionProcessor:
         modified = self.original_func.with_changes(body=cst.IndentedBlock(body=new_body))
         # Sort by step number so output is step_2, step_3, ...
         self.generated_functions.sort(key=lambda f: int(f.name.value.rsplit("_", 1)[-1]))
-        return [modified, *self.generated_functions]
+        return [modified] + self.generated_functions
 
     def _split_body(self, body: list, loop_context=None) -> list:
         """
@@ -90,11 +74,14 @@ class FunctionProcessor:
 
         # No remote calls found
         if loop_context:
+            # If body ends with a raise, skip unreachable continuation tail
+            if body and self._ends_with_raise(body):
+                return body
             # Loop mode: direct continuation back to loop step (same entity)
-            loop_step_name, _op_name, _ = loop_context
+            loop_step_name, op_name, _ = loop_context
             put_state = cst.parse_statement("ctx.put(state)")
             direct_call = self._create_direct_continuation_call(loop_step_name)
-            return [*body, put_state, direct_call]
+            return body + [put_state] + [direct_call]
         return body
 
     def _handle_remote_call(self, body: list, i: int, loop_context=None) -> list:
@@ -115,8 +102,6 @@ class FunctionProcessor:
 
             if target_var != "placeholder_return":
                 self.defined_vars.add(target_var)
-                if remote_method == "create" and isinstance(receiver, cst.Name):
-                    self.local_types[target_var] = receiver.value
 
             cont_body = restore_block + self._split_body(post_split, loop_context)
 
@@ -146,14 +131,12 @@ class FunctionProcessor:
 
         # Snapshot before branching
         saved_vars = self.defined_vars.copy()
-        saved_types = self.local_types.copy()
 
         # Process if-branch
         new_if_body = self._split_body(if_body_stmts + post_if, loop_context)
 
         # Restore for else/elif branch
         self.defined_vars = saved_vars.copy()
-        self.local_types = saved_types.copy()
 
         # Process else/elif branch
         new_else = None
@@ -176,13 +159,12 @@ class FunctionProcessor:
 
         # Restore to pre-branch state (caller determines what's defined after)
         self.defined_vars = saved_vars
-        self.local_types = saved_types
 
         new_if = if_stmt.with_changes(body=cst.IndentedBlock(body=new_if_body), orelse=new_else)
 
         if if_stmt.orelse is not None or (if_branch_dispatches and post_if):
             return [new_if]
-        return [new_if, *post_if]
+        return [new_if] + post_if
 
     def _parse_loop_iter(self, iter_node):
         """Returns (start_expr, bound_expr, is_range). Supports range() and collection iteration."""
@@ -208,30 +190,18 @@ class FunctionProcessor:
 
         # Current loop level
         self.loop_iter_counter += 1
-        iter_key = f"'__loop_index_{self.loop_iter_counter}'"
+        iter_var_name = f"__loop_index_{self.loop_iter_counter}"
 
         self.split_counter += 1
         loop_step_name = f"{self.original_func.name.value}_step_{self.split_counter}"
 
         start_expr, bound_expr, is_range = self._parse_loop_iter(for_stmt.iter)
 
-        # Init block: state[iter_key] = start_expr
+        # Init block: iter_var_name = start_expr
         init_iter = cst.SimpleStatementLine(
-            body=[
-                cst.Assign(
-                    targets=[
-                        cst.AssignTarget(
-                            target=cst.Subscript(
-                                value=cst.Name("state"),
-                                slice=[cst.SubscriptElement(slice=cst.Index(value=cst.SimpleString(iter_key)))],
-                            )
-                        )
-                    ],
-                    value=start_expr,
-                )
-            ]
+            body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(iter_var_name))], value=start_expr)]
         )
-        put_state = cst.parse_statement("ctx.put(state)")
+        self.defined_vars.add(iter_var_name)
 
         # Direct call to looping part of the function
         direct_call = self._create_direct_continuation_call(loop_step_name)
@@ -239,18 +209,11 @@ class FunctionProcessor:
 
         # Determine loop variable name and type (but don't add to defined_vars yet)
         loop_var_name = "_loop_var"
-        loop_var_type = None
         if isinstance(for_stmt.target, cst.Name):
             loop_var_name = for_stmt.target.value
-            if not is_range and isinstance(for_stmt.iter, cst.Name):
-                element_type = self.local_collection_element_types.get(for_stmt.iter.value)
-                if element_type:
-                    loop_var_type = element_type
 
         # Generate assignment for the loop var and increment
-        state_idx_access = cst.Subscript(
-            value=cst.Name("state"), slice=[cst.SubscriptElement(slice=cst.Index(value=cst.SimpleString(iter_key)))]
-        )
+        state_idx_access = cst.Name(iter_var_name)
 
         if is_range:
             var_val = state_idx_access
@@ -269,7 +232,6 @@ class FunctionProcessor:
 
         # Snapshot before processing branches
         saved_vars = self.defined_vars.copy()
-        saved_types = self.local_types.copy()
 
         # Post-loop code: processed with the OUTER loop_context (not this loop's)
         if post_loop:
@@ -279,22 +241,18 @@ class FunctionProcessor:
 
         # Restore before processing loop body (independent path)
         self.defined_vars = saved_vars.copy()
-        self.local_types = saved_types.copy()
 
         # Track loop variable for the loop body
         if loop_var_name != "_loop_var":
             self.defined_vars.add(loop_var_name)
-            if loop_var_type:
-                self.local_types[loop_var_name] = loop_var_type
 
         # Process loop body in loop mode
-        inner_loop_context = (loop_step_name, op_name, iter_key)
+        inner_loop_context = (loop_step_name, op_name, iter_var_name)
         loop_body_stmts = list(for_stmt.body.body)
         loop_body_processed = self._split_body(loop_body_stmts, inner_loop_context)
 
         # Restore to pre-branch state
         self.defined_vars = saved_vars
-        self.local_types = saved_types
 
         # Use if/else structure for bounds checking
         loop_condition = cst.Comparison(
@@ -305,14 +263,14 @@ class FunctionProcessor:
         if_block = cst.If(
             test=loop_condition,
             body=cst.IndentedBlock(body=post_loop_body),
-            orelse=cst.Else(body=cst.IndentedBlock(body=[var_assign, inc_idx, *loop_body_processed])),
+            orelse=cst.Else(body=cst.IndentedBlock(body=[var_assign, inc_idx] + loop_body_processed)),
         )
-        loop_step_body = [*restore_block, if_block]
+        loop_step_body = restore_block + [if_block]
 
         cont_func = self._create_continuation(loop_step_name, loop_step_body, "placeholder_return")
         self.generated_functions.append(cont_func)
 
-        return [*pre_loop, init_iter, put_state, direct_call]
+        return pre_loop + [init_iter] + [direct_call]
 
     def _create_direct_continuation_call(self, func_name: str):
         """
@@ -365,10 +323,12 @@ class FunctionProcessor:
                     if isinstance(stmt.orelse, cst.Else):
                         if self._any_remote_call(list(stmt.orelse.body.body)):
                             return True
-                    elif isinstance(stmt.orelse, cst.If) and self._any_remote_call([stmt.orelse]):
-                        return True
-            if isinstance(stmt, cst.For) and self._for_contains_remote_call(stmt):
-                return True
+                    elif isinstance(stmt.orelse, cst.If):
+                        if self._any_remote_call([stmt.orelse]):
+                            return True
+            if isinstance(stmt, cst.For):
+                if self._for_contains_remote_call(stmt):
+                    return True
         return False
 
     def _if_contains_remote_call(self, node: cst.If) -> bool:
@@ -379,47 +339,14 @@ class FunctionProcessor:
             if isinstance(node.orelse, cst.Else):
                 if self._any_remote_call(list(node.orelse.body.body)):
                     return True
-            elif isinstance(node.orelse, cst.If) and self._if_contains_remote_call(node.orelse):
-                return True
+            elif isinstance(node.orelse, cst.If):
+                if self._if_contains_remote_call(node.orelse):
+                    return True
         return False
 
     def _for_contains_remote_call(self, node: cst.For) -> bool:
-        """Check if a For loop's body contains remote calls, with temp type inference."""
-        temp_types = {}
-
-        # Temporarily infer loop variable type from direct iteration
-        if isinstance(node.target, cst.Name) and isinstance(node.iter, cst.Name):
-            loop_var_name = node.target.value
-            element_type = self.local_collection_element_types.get(node.iter.value)
-            if element_type and element_type in self.entities:
-                temp_types[loop_var_name] = element_type
-                self.local_types[loop_var_name] = element_type
-
-        # Temporarily infer types from body assignments like item = cart[index]
-        for stmt in node.body.body:
-            if isinstance(stmt, cst.SimpleStatementLine):
-                for el in stmt.body:
-                    if (
-                        isinstance(el, cst.Assign)
-                        and isinstance(el.value, cst.Subscript)
-                        and isinstance(el.value.value, cst.Name)
-                    ):
-                        collection_name = el.value.value.value
-                        element_type = self.local_collection_element_types.get(collection_name)
-                        if element_type and element_type in self.entities:
-                            for target in el.targets:
-                                if isinstance(target.target, cst.Name):
-                                    var_name = target.target.value
-                                    temp_types[var_name] = element_type
-                                    self.local_types[var_name] = element_type
-
-        result = self._any_remote_call(list(node.body.body))
-
-        # Clean up temporary types
-        for var_name in temp_types:
-            if var_name not in self.defined_vars:
-                self.local_types.pop(var_name, None)
-        return result
+        """Check if a For loop's body contains remote calls."""
+        return self._any_remote_call(list(node.body.body))
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -432,8 +359,7 @@ class FunctionProcessor:
             target_var = "placeholder_return"
             call_node = element.value
         else:
-            msg = f"Unexpected element: {type(element)}"
-            raise ValueError(msg)
+            raise ValueError(f"Unexpected element: {type(element)}")
 
         if isinstance(call_node.func, cst.Name):
             receiver = call_node.func
@@ -442,32 +368,18 @@ class FunctionProcessor:
             receiver = call_node.func.value
             remote_method = call_node.func.attr.value
         else:
-            msg = f"Unsupported call type: {type(call_node.func)}"
-            raise ValueError(msg)
+            raise ValueError(f"Unsupported call type: {type(call_node.func)}")
 
         return target_var, call_node, receiver, remote_method
 
     def _track_vars(self, stmt):
+        """Track variable existence only (for context saving)."""
         if isinstance(stmt, cst.SimpleStatementLine):
             for element in stmt.body:
                 if isinstance(element, cst.Assign):
-                    assigned_type = None
-                    # Constructor call: item = Item(...)
-                    if isinstance(element.value, cst.Call) and isinstance(element.value.func, cst.Name):
-                        assigned_type = element.value.func.value  # e.g., "Item"
-                    # Subscript access: item = cart[index] where cart: list[Item]
-                    elif isinstance(element.value, cst.Subscript) and isinstance(element.value.value, cst.Name):
-                        collection_name = element.value.value.value
-                        element_type = self.local_collection_element_types.get(collection_name)
-                        if element_type:
-                            assigned_type = element_type
-
                     for target in element.targets:
                         if isinstance(target.target, cst.Name):
-                            var_name = target.target.value
-                            self.defined_vars.add(var_name)
-                            if assigned_type:
-                                self.local_types[var_name] = assigned_type
+                            self.defined_vars.add(target.target.value)
         elif isinstance(stmt, cst.If):
             for s in stmt.body.body:
                 self._track_vars(s)
@@ -478,16 +390,22 @@ class FunctionProcessor:
                 elif isinstance(stmt.orelse, cst.If):
                     self._track_vars(stmt.orelse)
         elif isinstance(stmt, cst.For):
-            # Infer loop variable type from iterable's collection element type
-            if isinstance(stmt.target, cst.Name) and isinstance(stmt.iter, cst.Name):
-                element_type = self.local_collection_element_types.get(stmt.iter.value)
-                if element_type:
-                    self.local_types[stmt.target.value] = element_type
-                    self.defined_vars.add(stmt.target.value)
+            if isinstance(stmt.target, cst.Name):
+                self.defined_vars.add(stmt.target.value)
             for s in stmt.body.body:
                 self._track_vars(s)
 
+    def _ends_with_raise(self, body: list) -> bool:
+        """Check if the last statement is a raise (making any following code unreachable)."""
+        if not body:
+            return False
+        last = body[-1]
+        if isinstance(last, cst.SimpleStatementLine):
+            return any(isinstance(el, cst.Raise) for el in last.body)
+        return False
+
     def _is_remote_call(self, stmt):
+
         if not isinstance(stmt, cst.SimpleStatementLine) or not stmt.body:
             return False
 
@@ -504,43 +422,54 @@ class FunctionProcessor:
         if isinstance(val.func, cst.Name):
             return val.func.value in self.entities
 
-        # Case 2 & 3: Attribute calls, e.g., obj.run() or self.obj.run()
+        # Case 2: Attribute calls (obj.method() or self.obj.method())
+        # Use mypy metadata to check if the receiver evaluates to an entity type
         if isinstance(val.func, cst.Attribute):
-            base = val.func.value
-
-            # Case 2: local variable (item.get_price())
-            if isinstance(base, cst.Name):
-                var_type = self.local_types.get(base.value)
-                return var_type in self.entities
-
-            # Case 3: self attribute (self.item.get_price())
-            if isinstance(base, cst.Attribute) and isinstance(base.value, cst.Name) and base.value.value == "self":
-                attr_type = self.self_attr_types.get(base.attr.value)
-                return attr_type in self.entities
+            receiver = val.func.value
+            return self._is_entity_node(receiver)
 
         return False
 
-    def _resolve_operator_name(self, receiver: cst.BaseExpression) -> str:
-        # Case: Item() -> receiver is cst.Name(value="Item")
-        if isinstance(receiver, cst.Name):
-            name_val = receiver.value
-            # Is it a variable with a known type?
-            if name_val in self.local_types:
-                actual_type = self.local_types[name_val]
-                return self.entities.get(actual_type, actual_type)
-            # Is the name itself an entity (Class name)?
-            if name_val in self.entities:
-                return self.entities[name_val]
+    def _is_entity_node(self, node) -> bool:
+        """Check if a CST node's mypy type resolves to an entity."""
+        return self._get_entity_type(node) is not None
 
-        # Case: self.item.method() -> receiver is cst.Attribute
-        if (
-            isinstance(receiver, cst.Attribute)
-            and isinstance(receiver.value, cst.Name)
-            and receiver.value.value == "self"
-        ):
-            attr_name = receiver.attr.value
-            attr_type = self.self_attr_types.get(attr_name)
-            return self.entities.get(attr_type, attr_type)
+    def _get_entity_type(self, node) -> str:
+        mypy_type = self.metadata.get(node)
+
+        if mypy_type is not None:
+            # Only check the outermost type - e.g. list[Item] gives 'list', not 'Item'
+            # This prevents list.append() / list.sort() from being treated as entity calls
+            type_name = self._extract_outermost_type_name(mypy_type)
+            if type_name in self.entities:
+                return type_name
+
+        if isinstance(node, cst.Call) and isinstance(node.func, cst.Name):
+            if node.func.value in self.entities:
+                return node.func.value
+
+        return None
+
+    def _extract_outermost_type_name(self, mypy_type) -> str:
+        """Extract the outermost class name, ignoring generics.
+        e.g. 'builtins.list[module.Item]' -> 'list'
+             'test_tmp.Item' -> 'Item'
+        """
+        fullname = mypy_type.fullname
+        # Drop generic part: 'builtins.list[module.Item]' -> 'builtins.list'
+        if "[" in fullname:
+            fullname = fullname.split("[")[0]
+        return fullname.rsplit(".", 1)[-1]
+
+    def _resolve_operator_name(self, receiver: cst.BaseExpression) -> str:
+        # Case: Item() -> receiver is cst.Name(value="Item"), entity constructor
+        if isinstance(receiver, cst.Name) and receiver.value in self.entities:
+            return self.entities[receiver.value]
+
+        # Use mypy metadata to resolve the receiver's type
+        type_name = self._get_entity_type(receiver)
+        if type_name:
+            return self.entities[type_name]
 
         return self.entities.get(self.class_name, "unknown_operator")
 
@@ -585,51 +514,14 @@ class FunctionProcessor:
 
         # all defined variables and parameters to preserve context
         context_entries = [
-            cst.DictElement(key=cst.SimpleString(f"'{v}'"), value=cst.Name(v)) for v in self.defined_vars
+            cst.DictElement(
+                key=cst.SimpleString(f"'{v}'"),
+                value=cst.Name(v),
+            )
+            for v in self.defined_vars
         ]
 
         context_dict = cst.Dict(elements=context_entries)
-
-        # reply to the continuation
-        reply_info_dict = cst.Dict(
-            elements=[
-                cst.DictElement(cst.SimpleString("'op_name'"), cst.SimpleString(f"'{reply_op_name}'")),
-                cst.DictElement(cst.SimpleString("'fun'"), cst.SimpleString(f"'{next_func_name}'")),
-                cst.DictElement(
-                    key=cst.SimpleString("'id'"),
-                    value=cst.Attribute(
-                        value=cst.Name("ctx"),
-                        attr=cst.Name("key"),
-                    ),
-                ),
-                cst.DictElement(cst.SimpleString("'context'"), context_dict),
-            ]
-        )
-
-        init_reply_to = cst.If(
-            test=cst.Comparison(
-                left=cst.Name("reply_to"),
-                comparisons=[cst.ComparisonTarget(operator=cst.Is(), comparator=cst.Name("None"))],
-            ),
-            body=cst.IndentedBlock(
-                body=[
-                    cst.SimpleStatementLine(
-                        body=[cst.Assign(targets=[cst.AssignTarget(cst.Name("reply_to"))], value=cst.List(elements=[]))]
-                    )
-                ]
-            ),
-        )
-
-        push_reply_info = cst.SimpleStatementLine(
-            body=[
-                cst.Expr(
-                    value=cst.Call(
-                        func=cst.Attribute(value=cst.Name("reply_to"), attr=cst.Name("append")),
-                        args=[cst.Arg(value=reply_info_dict)],
-                    )
-                )
-            ]
-        )
 
         # remote call becomes an async statement
         async_call = cst.SimpleStatementLine(
@@ -651,16 +543,60 @@ class FunctionProcessor:
         if next_func_name == "None":
             return [async_call]
 
-        return [init_reply_to, push_reply_info, async_call]
+        push_call = cst.SimpleStatementLine(
+            body=[
+                cst.Assign(
+                    targets=[cst.AssignTarget(target=cst.Name("reply_to"))],
+                    value=cst.Call(
+                        func=cst.Name("push_continuation"),
+                        args=[
+                            cst.Arg(value=cst.Name("ctx")),
+                            cst.Arg(value=cst.Name("reply_to")),
+                            cst.Arg(value=cst.SimpleString(f"'{reply_op_name}'")),
+                            cst.Arg(value=cst.SimpleString(f"'{next_func_name}'")),
+                            cst.Arg(
+                                value=cst.Attribute(
+                                    value=cst.Name("ctx"),
+                                    attr=cst.Name("key"),
+                                )
+                            ),
+                            cst.Arg(value=context_dict),
+                        ],
+                    ),
+                )
+            ]
+        )
+
+        return [push_call, async_call]
 
     def _create_restore_block(self):
         """Restore locals from params dict"""
-        get_state = cst.parse_statement("state = ctx.get()")
-
         restore_statements = []
 
         sorted_vars = sorted(self.defined_vars)
 
+        if not sorted_vars:
+            return restore_statements
+
+        # params = resolve_context(ctx, func_context)
+        restore_statements.append(
+            cst.SimpleStatementLine(
+                body=[
+                    cst.Assign(
+                        targets=[cst.AssignTarget(target=cst.Name("params"))],
+                        value=cst.Call(
+                            func=cst.Name("resolve_context"),
+                            args=[
+                                cst.Arg(value=cst.Name("ctx")),
+                                cst.Arg(value=cst.Name("func_context")),
+                            ],
+                        ),
+                    )
+                ]
+            )
+        )
+
+        # (var1, var2, ...) = (params['var1'], params['var2'], ...)
         restore_statements.append(
             cst.SimpleStatementLine(
                 body=[
@@ -688,7 +624,7 @@ class FunctionProcessor:
             )
         )
 
-        return [get_state, *restore_statements]
+        return restore_statements
 
     def _create_continuation(self, name, body, target_var):
         """Create a continuation function"""
@@ -706,7 +642,7 @@ class FunctionProcessor:
             params=cst.Parameters(
                 params=[
                     cst.Param(name=cst.Name("ctx"), annotation=cst.Annotation(cst.Name("StatefulFunction"))),
-                    cst.Param(name=cst.Name("params")),
+                    cst.Param(name=cst.Name("func_context")),
                     cst.Param(name=cst.Name(target_var), default=cst.Name("None")),
                     reply_to_param,
                 ]

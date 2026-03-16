@@ -13,15 +13,15 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
     """
 
     def __init__(self):
-        super().__init__()
         self.state_dirty_stack = [False]
+        self.state_aliases = set()  # variables assigned from state[...]
 
     def _mark_dirty(self):
         self.state_dirty_stack[-1] = True
 
     def _is_graph_terminal(self, node: cst.CSTNode | None) -> bool:
         """
-        Recursively checks if a node guarantees an exit (return or raise).
+        Recursively checks if a node guarantees an exit (return, raise, or async dispatch).
         """
         if node is None:
             return False
@@ -30,6 +30,17 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
             return True
 
         if isinstance(node, cst.SimpleStatementLine):
+            # Check for ctx.call_remote_async(...) — after dispatch, function is done
+            for child in node.body:
+                if isinstance(child, cst.Expr) and isinstance(child.value, cst.Call):
+                    func = child.value.func
+                    if (
+                        isinstance(func, cst.Attribute)
+                        and isinstance(func.value, cst.Name)
+                        and func.value.value == "ctx"
+                        and func.attr.value == "call_remote_async"
+                    ):
+                        return True
             return any(self._is_graph_terminal(child) for child in node.body)
 
         if isinstance(node, cst.IndentedBlock):
@@ -53,18 +64,62 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
 
         return False
 
-    def leave_Assign(self, _original_node, updated_node):
+    def leave_Assign(self, original_node, updated_node):
         for target in updated_node.targets:
+            # Track state[...] = ... as dirty
             if m.matches(target.target, m.Subscript(value=m.Name("state"))):
                 self._mark_dirty()
+            # Track state aliases: var = state[...]
+            if isinstance(target.target, cst.Name) and m.matches(
+                updated_node.value, m.Subscript(value=m.Name("state"))
+            ):
+                self.state_aliases.add(target.target.value)
         return updated_node
 
-    def leave_AugAssign(self, _original_node, updated_node):
+    def leave_AugAssign(self, original_node, updated_node):
         if m.matches(updated_node.target, m.Subscript(value=m.Name("state"))):
             self._mark_dirty()
         return updated_node
 
-    def leave_SimpleStatementLine(self, _original_node, updated_node):
+    def leave_Expr(self, original_node, updated_node):
+        """Detect method calls on state aliases (e.g., attr_1.append(...))."""
+        if (
+            isinstance(updated_node.value, cst.Call)
+            and isinstance(updated_node.value.func, cst.Attribute)
+            and isinstance(updated_node.value.func.value, cst.Name)
+            and updated_node.value.func.value.value in self.state_aliases
+        ):
+            self._mark_dirty()
+        return updated_node
+
+    def _is_call_remote_async(self, node: cst.CSTNode) -> bool:
+        """Check if a statement is a ctx.call_remote_async(...) call."""
+        if isinstance(node, cst.SimpleStatementLine):
+            for el in node.body:
+                if isinstance(el, cst.Expr) and isinstance(el.value, cst.Call):
+                    func = el.value.func
+                    if (
+                        isinstance(func, cst.Attribute)
+                        and isinstance(func.value, cst.Name)
+                        and func.value.value == "ctx"
+                        and func.attr.value == "call_remote_async"
+                    ):
+                        return True
+        return False
+
+    def _has_reply_to_param(self, node: cst.FunctionDef) -> bool:
+        """Check if a function has a reply_to parameter."""
+        for param in node.params.params:
+            if param.name.value == "reply_to":
+                return True
+        return False
+
+    def leave_SimpleStatementLine(self, original_node, updated_node):
+        # Handle ctx.call_remote_async: prepend ctx.put(state) if dirty
+        if self._is_call_remote_async(updated_node) and self.state_dirty_stack[-1]:
+            put_state = cst.parse_statement("ctx.put(state)")
+            return cst.FlattenSentinel([put_state, updated_node])
+
         return_node = None
         for node in updated_node.body:
             if isinstance(node, cst.Return):
@@ -76,51 +131,40 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
 
         ret_val = return_node.value if return_node.value else cst.Name("None")
 
-        pop_reply = cst.parse_statement("reply_info = reply_to.pop()")
-
-        params_tuple = cst.Tuple(
-            elements=[
-                cst.Element(value=cst.parse_expression('reply_info["context"]')),
-                cst.Element(value=ret_val),
-                cst.Element(value=cst.Name("reply_to")),
-            ]
-        )
-
-        call_remote = cst.Call(
-            func=cst.parse_expression("ctx.call_remote_async"),
+        # Generate: return send_reply(ctx, reply_to, result)
+        send_reply_call = cst.Call(
+            func=cst.Name("send_reply"),
             args=[
-                cst.Arg(keyword=cst.Name("operator_name"), value=cst.parse_expression('reply_info["op_name"]')),
-                cst.Arg(keyword=cst.Name("function_name"), value=cst.parse_expression('reply_info["fun"]')),
-                cst.Arg(keyword=cst.Name("key"), value=cst.parse_expression('reply_info["id"]')),
-                cst.Arg(keyword=cst.Name("params"), value=params_tuple),
+                cst.Arg(value=cst.Name("ctx")),
+                cst.Arg(value=cst.Name("reply_to")),
+                cst.Arg(value=ret_val),
             ],
         )
 
-        if_block = cst.IndentedBlock(
-            body=[
-                cst.SimpleStatementLine(body=[pop_reply.body[0]]),
-                cst.SimpleStatementLine(body=[cst.Expr(value=call_remote)]),
-                cst.SimpleStatementLine(body=[cst.Return(value=None)]),
-            ]
-        )
-
-        else_block = cst.Else(body=cst.IndentedBlock(body=[updated_node]))
-
-        if_stmt = cst.If(test=cst.Name("reply_to"), body=if_block, orelse=else_block)
+        res_stmt = cst.SimpleStatementLine(body=[cst.Return(value=send_reply_call)])
 
         put_state = cst.parse_statement("ctx.put(state)")
 
-        return cst.FlattenSentinel([put_state, if_stmt]) if self.state_dirty_stack[-1] else if_stmt
+        res = cst.FlattenSentinel([put_state, res_stmt]) if self.state_dirty_stack[-1] else res_stmt
 
-    def leave_FunctionDef(self, _original_node, updated_node):
-        if self.state_dirty_stack[-1]:
-            body_stmts = updated_node.body.body
-            last_stmt = body_stmts[-1] if body_stmts else None
+        return res
 
-            if not self._is_graph_terminal(last_stmt):
-                put_state = cst.parse_statement("ctx.put(state)")
-                new_body = [*list(updated_node.body.body), put_state]
+    def leave_FunctionDef(self, original_node, updated_node):
+        body_stmts = updated_node.body.body
+        last_stmt = body_stmts[-1] if body_stmts else None
 
+        if not self._is_graph_terminal(last_stmt):
+            new_body = list(updated_node.body.body)
+            # Add send_reply for functions with reply_to so the reply chain isn't lost
+            if self._has_reply_to_param(updated_node):
+                if self.state_dirty_stack[-1]:
+                    new_body.append(cst.parse_statement("ctx.put(state)"))
+                new_body.append(cst.parse_statement("return send_reply(ctx, reply_to, None)"))
+            elif self.state_dirty_stack[-1]:
+                # No reply_to but state dirty — just flush state
+                new_body.append(cst.parse_statement("ctx.put(state)"))
+
+            if new_body != list(updated_node.body.body):
                 return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
 
         return updated_node
@@ -132,10 +176,9 @@ class RemoteCallLinearizer(cst.CSTTransformer):
     """
 
     def __init__(self):
-        super().__init__()
         self.call_counter = 0
 
-    def leave_FunctionDef(self, _original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
         """Process each function and linearize remote calls."""
         self.call_counter = 0
 
@@ -151,11 +194,10 @@ class StatementLinearizer(cst.CSTTransformer):
     """
 
     def __init__(self):
-        super().__init__()
         self.counter = 1
 
     def leave_SimpleStatementLine(
-        self, _original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine
+        self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine
     ) -> cst.SimpleStatementLine | cst.FlattenSentinel[cst.SimpleStatementLine]:
         """Process each statement and extract method calls."""
         new_statements = []
@@ -175,19 +217,15 @@ class StatementLinearizer(cst.CSTTransformer):
                     if new_stmt.value.value == last_extracted_var:
                         should_collapse = True
 
-                elif (
-                    isinstance(new_stmt, cst.Assign)
-                    and len(new_stmt.targets) == 1
-                    and isinstance(new_stmt.value, cst.Name)
-                    and new_stmt.value.value == last_extracted_var
-                ):
-                    should_collapse = True
+                elif isinstance(new_stmt, cst.Assign) and len(new_stmt.targets) == 1:
+                    if isinstance(new_stmt.value, cst.Name) and new_stmt.value.value == last_extracted_var:
+                        should_collapse = True
 
             if should_collapse:
                 extractor.extracted_calls.pop()
                 new_stmt = new_stmt.with_changes(value=last_extracted_call)
-            else:
-                self.counter = extractor.counter
+
+            self.counter = extractor.counter
 
             for var_name, call in extractor.extracted_calls:
                 assignment = cst.SimpleStatementLine(
@@ -199,7 +237,7 @@ class StatementLinearizer(cst.CSTTransformer):
 
         return cst.FlattenSentinel(new_statements)
 
-    def leave_If(self, _original_node: cst.If, updated_node: cst.If) -> cst.If | cst.FlattenSentinel[cst.BaseStatement]:
+    def leave_If(self, original_node: cst.If, updated_node: cst.If) -> cst.If | cst.FlattenSentinel[cst.BaseStatement]:
         """Handle if statements specially."""
         new_statements = []
 
@@ -230,16 +268,27 @@ class CallExtractorAndReplacer(cst.CSTTransformer):
     """
 
     def __init__(self, start_counter=1):
-        super().__init__()
-        self.extracted_calls: list[tuple[str, cst.Call]] = []
+        self.extracted_calls: list[tuple[str, cst.BaseExpression]] = []
         self.counter = start_counter
 
-    def leave_Call(self, _original_node: cst.Call, updated_node: cst.Call) -> cst.BaseExpression:
+    def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.BaseExpression:
         if isinstance(updated_node.func, cst.Attribute):
+            receiver = updated_node.func.value
+            new_func = updated_node.func
+
+            if not isinstance(receiver, cst.Name):
+                receiver_var_name = f"attr_{self.counter}"
+                self.counter += 1
+                self.extracted_calls.append((receiver_var_name, receiver))
+
+                new_func = new_func.with_changes(value=cst.Name(receiver_var_name))
+
+            new_call = updated_node.with_changes(func=new_func)
+
             var_name = f"attr_{self.counter}"
             self.counter += 1
 
-            self.extracted_calls.append((var_name, updated_node))
+            self.extracted_calls.append((var_name, new_call))
 
             return cst.Name(var_name)
 
@@ -252,7 +301,6 @@ class InitBodyTransformer(cst.CSTTransformer):
     """
 
     def __init__(self):
-        super().__init__()
         self.state_dict_entries = []
         self.other_statements = []
 
@@ -265,14 +313,15 @@ class InitBodyTransformer(cst.CSTTransformer):
 
                     self.state_dict_entries.append(cst.DictElement(key=cst.SimpleString(f"'{key}'"), value=value))
                     return cst.RemoveFromParent()
-            elif isinstance(stmt, cst.Assign) and len(stmt.targets) == 1:
-                target = stmt.targets[0].target
-                if m.matches(target, m.Attribute(value=m.Name("self"))):
-                    key = target.attr.value
-                    value = stmt.value
+            elif isinstance(stmt, cst.Assign):
+                if len(stmt.targets) == 1:
+                    target = stmt.targets[0].target
+                    if m.matches(target, m.Attribute(value=m.Name("self"))):
+                        key = target.attr.value
+                        value = stmt.value
 
-                    self.state_dict_entries.append(cst.DictElement(key=cst.SimpleString(f"'{key}'"), value=value))
-                    return cst.RemoveFromParent()
+                        self.state_dict_entries.append(cst.DictElement(key=cst.SimpleString(f"'{key}'"), value=value))
+                        return cst.RemoveFromParent()
 
         self.other_statements.append(updated_node)
         return updated_node
@@ -280,10 +329,13 @@ class InitBodyTransformer(cst.CSTTransformer):
 
 class StateAccessTransformer(cst.CSTTransformer):
     """
-    Transforms self.attribute access to state['attribute'] dictionary access.
+    Transforms:
+    1. self.attribute -> state['attribute']
+    2. self           -> ctx.key
     """
 
     def leave_Attribute(self, original_node, updated_node):
+        # Handles self.attribute -> state['attribute']
         if m.matches(original_node, m.Attribute(value=m.Name("self"))):
             return cst.Subscript(
                 value=cst.Name("state"),
@@ -291,16 +343,32 @@ class StateAccessTransformer(cst.CSTTransformer):
             )
         return updated_node
 
+    def leave_Name(self, original_node, updated_node):
+        # Handles standalone 'self' -> 'ctx.key'
+        if m.matches(original_node, m.Name("self")):
+            return cst.Attribute(value=cst.Name("ctx"), attr=cst.Name("key"))
+        return updated_node
+
+
+class AnnotationNameReplacer(cst.CSTTransformer):
+    def __init__(self, get_key_type_func):
+        self.get_key_type = get_key_type_func
+
+    def leave_Name(self, original_node, updated_node):
+        replacement = self.get_key_type(original_node.value)
+        if replacement:
+            return updated_node.with_changes(value=replacement)
+        return updated_node
+
 
 class EntityTypeReplacer(cst.CSTTransformer):
     """
     Replaces entity type references in annotations with the key's type.
     e.g., `item: Item` -> `item: str`, `-> Item` -> `-> str`
-    Also handles: `items: list[Item]` -> `items: list[str]`
+    Also handles: `items: list[Item]` -> `items: list[str]`, `list[list[Item]]` -> `list[list[str]]`
     """
 
     def __init__(self, entity_keys: dict[str, str], entity_init_params: dict[str, dict[str, str]]):
-        super().__init__()
         self.entity_keys = entity_keys
         self.entity_init_params = entity_init_params
 
@@ -312,23 +380,7 @@ class EntityTypeReplacer(cst.CSTTransformer):
             return init_params[key_field]
         return None
 
-    def leave_Annotation(self, _original_node, updated_node):
-        ann = updated_node.annotation
-
-        # Simple type: `item: Item` or `-> Item`
-        if isinstance(ann, cst.Name):
-            replacement = self._get_key_type(ann.value)
-            if replacement:
-                return updated_node.with_changes(annotation=cst.Name(replacement))
-
-        # Subscript type: `items: list[Item]`
-        if isinstance(ann, cst.Subscript) and ann.slice and len(ann.slice) == 1:
-            inner = ann.slice[0].slice
-            if isinstance(inner, cst.Index) and isinstance(inner.value, cst.Name):
-                replacement = self._get_key_type(inner.value.value)
-                if replacement:
-                    new_slice = [cst.SubscriptElement(slice=cst.Index(value=cst.Name(replacement)))]
-                    new_ann = ann.with_changes(slice=new_slice)
-                    return updated_node.with_changes(annotation=new_ann)
-
-        return updated_node
+    def leave_Annotation(self, original_node, updated_node):
+        replacer = AnnotationNameReplacer(self._get_key_type)
+        new_ann = updated_node.annotation.visit(replacer)
+        return updated_node.with_changes(annotation=new_ann)

@@ -116,6 +116,25 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
 
         self._clean_up_cfg_ghosts(start)
 
+    def leave_Module(self, node: cst.Module) -> None:
+        # Remove unreachable parts of the CFG (e.g. unused finally clause instantiations, dead code after a return)
+        reachable = set()
+        workstack = []
+        for start, _ in self._start_end:
+            reachable.add(start)
+            workstack.append(start)
+
+        while len(workstack) > 0:
+            node = workstack.pop()
+            for to in self._cfg.get(node, []):
+                if to not in reachable:
+                    reachable.add(to)
+                    workstack.append(to)
+
+        for k in self._cfg:
+            if k not in reachable:
+                del self._cfg[k]
+
     def _visit_BaseSuite(
         self,
         statements: cst.BaseSuite | cst.SimpleStatementLine,

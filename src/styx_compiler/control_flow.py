@@ -1,5 +1,5 @@
 """
-A control-flow graph consists of a Start CfgNode, an End CfgNode, and some Node CfgNodes in between.
+A control-flow graph consists of a start CfgNode, an end CfgNode, and some Node CfgNodes in between.
 It looks like ``dict[CfgNode, list[CfgNode]]``, along with a start and end. You can reuse the dict to
 contain multiple graphs. Each CfgNode has an index, an integer that uniquely identifies a CST node.
 """
@@ -26,28 +26,6 @@ class Node:
 
 
 @dataclass(frozen=True)
-class Start:
-    """
-    A start node in the control flow graph
-
-    Uses an index from the IndexProvider to tie it to the CST
-    """
-
-    index: int
-
-
-@dataclass(frozen=True)
-class End:
-    """
-    An end node in the control flow graph
-
-    Uses an index from the IndexProvider to tie it to the CST
-    """
-
-    index: int
-
-
-@dataclass(frozen=True)
 class Ghost:
     """
     Not a real node, just a construction device that gets removed later
@@ -59,7 +37,7 @@ class Ghost:
     number: int
 
 
-CfgNode = Node | Start | End | Ghost
+CfgNode = Node | Ghost
 
 
 class ComputeControlFlowGraph(cst.CSTVisitor):
@@ -93,7 +71,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
         cur = Node(self.get_metadata(IndexProvider, cst_node), number)
         return self._edge(prev, cur)
 
-    def _clean_up_cfg_ghosts(self, start: Start) -> None:
+    def _clean_up_cfg_ghosts(self, start: CfgNode) -> None:
         seen: set[CfgNode] = set()
         workstack: list[CfgNode] = [start]
         seen.add(start)
@@ -119,8 +97,8 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
         index = self.get_metadata(IndexProvider, node)
-        start = Start(index)
-        end = End(index)
+        start = Node(index, 0)
+        end = Node(index, 1)
         self._start_end.append((start, end))
 
         prev = [start]
@@ -132,7 +110,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             self._edge(prev, cur)
             prev = [cur]
 
-        prev = self._visit_BaseSuite(node.body, number, prev, fn_end=end, exception_targets=[end])
+        prev = self._visit_BaseSuite(node.body, number, prev, fn_end=end, exception_target=end)
 
         self._edge(prev, end)
 
@@ -143,8 +121,8 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
         statements: cst.BaseSuite | cst.SimpleStatementLine,
         number: int,
         prev: list[CfgNode],
-        fn_end: End,
-        exception_targets: list[CfgNode],
+        fn_end: CfgNode,
+        exception_target: CfgNode,
         loop_continue_target: CfgNode | None = None,
         loop_break_target: CfgNode | None = None,
     ) -> list[CfgNode]:
@@ -154,7 +132,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 number,
                 prev,
                 fn_end=fn_end,
-                exception_targets=exception_targets,
+                exception_target=exception_target,
                 loop_continue_target=loop_continue_target,
                 loop_break_target=loop_break_target,
             )
@@ -165,8 +143,8 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
         statement: cst.BaseStatement | cst.BaseSmallStatement,
         number: int,
         prev: list[CfgNode],
-        fn_end: End,
-        exception_targets: list[CfgNode],
+        fn_end: CfgNode,
+        exception_target: CfgNode,
         loop_continue_target: CfgNode | None = None,
         loop_break_target: CfgNode | None = None,
     ) -> list[CfgNode]:
@@ -244,7 +222,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 prev = self._visit_expression(statement.exc, number, prev)
             if statement.cause is not None:
                 prev = self._visit_expression(statement.cause.item, number, prev)
-            self._edges(prev, exception_targets)
+            self._edge(prev, exception_target)
             prev = []
         elif m.matches(statement, m.Return()):
             statement: cst.Return = cst.ensure_type(statement, cst.Return)
@@ -270,7 +248,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 index,
                 for_loop_continue_target,
                 fn_end=fn_end,
-                exception_targets=exception_targets,
+                exception_target=exception_target,
                 loop_continue_target=loop_continue_target,
                 loop_break_target=loop_break_target,
             )
@@ -285,7 +263,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 number,
                 prev,
                 fn_end=fn_end,
-                exception_targets=exception_targets,
+                exception_target=exception_target,
                 loop_continue_target=loop_continue_target,
                 loop_break_target=loop_break_target,
             )
@@ -298,7 +276,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                     number,
                     prev,
                     fn_end=fn_end,
-                    exception_targets=exception_targets,
+                    exception_target=exception_target,
                     loop_continue_target=loop_continue_target,
                     loop_break_target=loop_break_target,
                 )
@@ -309,23 +287,50 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                     number,
                     prev,
                     fn_end=fn_end,
-                    exception_targets=exception_targets,
+                    exception_target=exception_target,
                     loop_continue_target=loop_continue_target,
                     loop_break_target=loop_break_target,
                 )
             prev = [*body, *prev]
         elif m.matches(statement, m.Try()):
-            # TODO: suspicious, probably wrong around finally statements in nested try
             statement: cst.Try = cst.ensure_type(statement, cst.Try)
+            finally_number = number
+
+            def wrap_in_finally(exit: CfgNode) -> CfgNode:
+                nonlocal statement, finally_number, fn_end, exception_target, loop_continue_target, loop_break_target
+                if statement.finalbody is not None:
+                    entry = Ghost(self.get_metadata(IndexProvider, statement.finalbody), finally_number)
+                    finalbody: cst.Finally = cst.ensure_type(statement.finalbody, cst.Finally)
+                    prev = self._visit_BaseSuite(
+                        finalbody.body,
+                        finally_number,
+                        [entry],
+                        fn_end=fn_end,
+                        exception_target=exception_target,
+                        loop_continue_target=loop_continue_target,
+                        loop_break_target=loop_break_target,
+                    )
+                    self._edge(prev, exit)
+                    finally_number += 1
+                    return entry
+                return exit
+
+            # Install instantiation of finally clause before different ways you can exit a try body or handler body.
+            local_fn_end = wrap_in_finally(fn_end)
+            local_exception_target = local_fn_end if fn_end == exception_target else wrap_in_finally(exception_target)
+            local_loop_continue_target = wrap_in_finally(loop_continue_target)
+            local_loop_break_target = wrap_in_finally(loop_break_target)
+
             handler_entries = []
             handler_cond = []
             handler_exits = []
+            # Build the chain of exception handlers, each is modeled with a conditional going into the handler body or
+            #  to the next conditional
             for handler in statement.handlers:
                 handler: cst.ExceptHandler = cst.ensure_type(handler, cst.ExceptHandler)  # noqa: PLW2901
                 handler_index = self.get_metadata(IndexProvider, handler)
                 handler_entry = Ghost(handler_index, 0)
-                for_loop_break_target = Ghost(handler_index, 1)
-                handler_exit = for_loop_break_target
+                handler_exit = Ghost(handler_index, 1)
                 handler_entries.append(handler_entry)
                 if len(handler_cond) > 0:
                     self._edge(handler_cond[-1], handler_entry)
@@ -340,51 +345,50 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                     handler.body,
                     number,
                     handler_prev,
-                    fn_end=fn_end,
-                    exception_targets=exception_targets,
-                    loop_continue_target=loop_continue_target,
-                    loop_break_target=loop_break_target,
+                    fn_end=local_fn_end,
+                    exception_target=local_exception_target,
+                    loop_continue_target=local_loop_continue_target,
+                    loop_break_target=local_loop_break_target,
                 )
                 self._edge(handler_prev, handler_exit)
+            # Try body first, using the handler chain as exception target and the finally-wrapped other targets
             prev = self._visit_BaseSuite(
                 statement.body,
                 number,
                 prev,
-                fn_end=fn_end,
-                exception_targets=handler_entries,
-                loop_continue_target=loop_continue_target,
-                loop_break_target=loop_break_target,
+                fn_end=local_fn_end,
+                exception_target=handler_entries[0] if len(handler_entries) > 0 else local_exception_target,
+                loop_continue_target=local_loop_continue_target,
+                loop_break_target=local_loop_break_target,
             )
+            # If we have handlers, we go into them after the try body too in case of an exception that wasn't
+            #  explicitly raised
             if len(handler_entries) > 0:
                 self._edge(prev, handler_entries[0])
-                prev = handler_cond[-1]
+                # From the final handler cond we can go to the finally-wrapped outside exception target if none of our
+                #  local handlers matched against the raised exception.
+                self._edge(handler_cond[-1], local_exception_target)
+            else:
+                # If there are no handlers, we might go to the finally-wrapped outside exception target.
+                self._edge(prev, local_exception_target)
+            # If no exception was raised, we go into the else clause if it exists
             if statement.orelse is not None:
                 orelse: cst.Else = cst.ensure_type(statement.orelse, cst.Else)
                 prev = self._visit_BaseSuite(
                     orelse.body,
                     number,
                     prev,
-                    fn_end=fn_end,
-                    exception_targets=exception_targets,
-                    loop_continue_target=loop_continue_target,
-                    loop_break_target=loop_break_target,
+                    fn_end=local_fn_end,
+                    exception_target=local_exception_target,
+                    loop_continue_target=local_loop_continue_target,
+                    loop_break_target=local_loop_break_target,
                 )
-            prev = [*prev, *handler_exits]
-            if statement.finalbody is not None:
-                finalbody: cst.Finally = cst.ensure_type(statement.finalbody, cst.Finally)
-                prev = self._visit_BaseSuite(
-                    finalbody.body,
-                    number,
-                    prev,
-                    fn_end=fn_end,
-                    exception_targets=exception_targets,
-                    loop_continue_target=loop_continue_target,
-                    loop_break_target=loop_break_target,
-                )
-                # Alternative way to exit finally if the try/except did a return or the except raised again.
-                # This is the simple, coarse-grained version, probably better to instantiate the finalbody multiple
-                #  times, that'll also be more easily correct (related to above TODO)
-                self._edge(prev, fn_end)
+            # Ghost node for exiting the finally clause normally
+            try_exit = Ghost(self.get_metadata(IndexProvider, statement), 0)
+            finally_entry = wrap_in_finally(try_exit)
+            # The normal entry into a normal finally clause at the end of the body/else or handler
+            self._edge([*prev, *handler_exits], finally_entry)
+            prev = [try_exit]
         elif m.matches(statement, m.While()):
             statement: cst.While = cst.ensure_type(statement, cst.While)
             index = self.get_metadata(IndexProvider, statement)
@@ -398,7 +402,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 index,
                 while_loop_continue_target,
                 fn_end=fn_end,
-                exception_targets=exception_targets,
+                exception_target=exception_target,
                 loop_continue_target=loop_continue_target,
                 loop_break_target=loop_break_target,
             )
@@ -413,7 +417,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 number,
                 prev,
                 fn_end=fn_end,
-                exception_targets=exception_targets,
+                exception_target=exception_target,
                 loop_continue_target=loop_continue_target,
                 loop_break_target=loop_break_target,
             )
@@ -428,7 +432,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 number,
                 prev,
                 fn_end=fn_end,
-                exception_targets=exception_targets,
+                exception_target=exception_target,
                 loop_continue_target=loop_continue_target,
                 loop_break_target=loop_break_target,
             )
@@ -445,8 +449,8 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
         prev: list[CfgNode],
         index: int,
         this_loop_continue_target: Ghost,
-        fn_end: End,
-        exception_targets: list[CfgNode],
+        fn_end: CfgNode,
+        exception_target: CfgNode,
         loop_continue_target: CfgNode | None,
         loop_break_target: CfgNode | None,
     ) -> list[CfgNode]:
@@ -456,7 +460,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             number,
             prev,
             fn_end=fn_end,
-            exception_targets=exception_targets,
+            exception_target=exception_target,
             loop_continue_target=this_loop_continue_target,
             loop_break_target=this_loop_break_target,
         )
@@ -467,7 +471,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 number,
                 prev,
                 fn_end=fn_end,
-                exception_targets=exception_targets,
+                exception_target=exception_target,
                 loop_continue_target=loop_continue_target,
                 loop_break_target=loop_break_target,
             )

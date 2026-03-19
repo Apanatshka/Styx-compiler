@@ -1,13 +1,22 @@
-from typing import Dict, List, Tuple, Union
+from collections.abc import Mapping
+
 import libcst as cst
-from libcst_mypy.utils import MypyType
+
 
 class FunctionProcessor:
     """
     Actively slices a function into asynchronous steps using locals().update()
     """
-    
-    def __init__(self, original_func: cst.FunctionDef, class_name: str, entities: Dict[str, str], metadata: Dict, entity_keys: Dict[str, str] = None, entity_init_params: Dict[str, List[str]] = None):
+
+    def __init__(
+        self,
+        original_func: cst.FunctionDef,
+        class_name: str,
+        entities: dict[str, str],
+        metadata: Mapping,
+        entity_keys: dict[str, str] | None = None,
+        entity_init_params: dict[str, list[str]] | None = None,
+    ):
         self.original_func = original_func
         self.class_name = class_name
 
@@ -21,31 +30,29 @@ class FunctionProcessor:
 
         self.split_counter = 1
         self.loop_iter_counter = 0
-        self.generated_functions: List[cst.FunctionDef] = []
-        
+        self.generated_functions: list[cst.FunctionDef] = []
+
         # Track local variables to save/restore
         self.defined_vars = set()
 
         # Pre-scan arguments to define variables
         for param in original_func.params.params:
-            if param.name.value != 'self' and param.name.value != 'ctx':
+            if param.name.value != "self" and param.name.value != "ctx":
                 self.defined_vars.add(param.name.value)
 
-    def process(self) -> List[cst.FunctionDef]:
+    def process(self) -> list[cst.FunctionDef]:
         """
         Main logic: Scans, Splits, and Returns a list of functions.
         """
         body = list(self.original_func.body.body)
         new_body = self._split_body(body)
 
-        modified = self.original_func.with_changes(
-            body=cst.IndentedBlock(body=new_body)
-        )
+        modified = self.original_func.with_changes(body=cst.IndentedBlock(body=new_body))
         # Sort by step number so output is step_2, step_3, ...
-        self.generated_functions.sort(key=lambda f: int(f.name.value.rsplit('_', 1)[-1]))
-        return [modified] + self.generated_functions
+        self.generated_functions.sort(key=lambda f: int(f.name.value.rsplit("_", 1)[-1]))
+        return [modified, *self.generated_functions]
 
-    def _split_body(self, body: List, loop_context=None) -> List:
+    def _split_body(self, body: list, loop_context=None) -> list:
         """
         Scan the function for remote calls and split the function when one is detected.
 
@@ -73,20 +80,19 @@ class FunctionProcessor:
             if body and self._ends_with_raise(body):
                 return body
             # Loop mode: direct continuation back to loop step (same entity)
-            loop_step_name, op_name, _ = loop_context
+            loop_step_name, _op_name, _ = loop_context
             put_state = cst.parse_statement("ctx.put(state)")
             direct_call = self._create_direct_continuation_call(loop_step_name)
-            return body + [put_state] + [direct_call]
-        else:
-            return body
+            return [*body, put_state, direct_call]
+        return body
 
-    def _handle_remote_call(self, body: List, i: int, loop_context=None) -> List:
+    def _handle_remote_call(self, body: list, i: int, loop_context=None) -> list:
         """Split at a remote call found at index i in body."""
         stmt = body[i]
-        post_split = body[i+1:]
+        post_split = body[i + 1 :]
         has_continuation = len(post_split) > 0
 
-        target_var, call_node, receiver, remote_method = self._extract_call_info(stmt)
+        target_var, call_node, receiver, remote_method = FunctionProcessor._extract_call_info(stmt)
 
         if has_continuation:
             self.split_counter += 1
@@ -105,20 +111,19 @@ class FunctionProcessor:
             self.generated_functions.append(cont_func)
 
             return body[:i] + dispatch_block
+        # Last remote call
+        if loop_context:
+            loop_step_name, _, _ = loop_context
+            dispatch_block = self._create_dispatch_block(receiver, remote_method, call_node, loop_step_name)
         else:
-            # Last remote call
-            if loop_context:
-                loop_step_name, _, _ = loop_context
-                dispatch_block = self._create_dispatch_block(receiver, remote_method, call_node, loop_step_name)
-            else:
-                dispatch_block = self._create_dispatch_block(receiver, remote_method, call_node, "None")
+            dispatch_block = self._create_dispatch_block(receiver, remote_method, call_node, "None")
 
-            return body[:i] + dispatch_block
+        return body[:i] + dispatch_block
 
-    def _handle_if(self, body: List, i: int, loop_context=None) -> List:
+    def _handle_if(self, body: list, i: int, loop_context=None) -> list:
         """Split at an if-statement (at index i) whose branches contain remote calls."""
         pre_if = body[:i]
-        result = self._process_if_node(body[i], body[i+1:], loop_context)
+        result = self._process_if_node(body[i], body[i + 1 :], loop_context)
         return pre_if + result
 
     def _process_if_node(self, if_stmt, post_if, loop_context=None):
@@ -157,38 +162,31 @@ class FunctionProcessor:
         # Restore to pre-branch state (caller determines what's defined after)
         self.defined_vars = saved_vars
 
-        new_if = if_stmt.with_changes(
-            body=cst.IndentedBlock(body=new_if_body),
-            orelse=new_else
-        )
+        new_if = if_stmt.with_changes(body=cst.IndentedBlock(body=new_if_body), orelse=new_else)
 
         if if_stmt.orelse is not None or (if_branch_dispatches and post_if):
             return [new_if]
-        else:
-            return [new_if] + post_if
+        return [new_if, *post_if]
 
     def _parse_loop_iter(self, iter_node):
         """Returns (start_expr, bound_expr, is_range). Supports range() and collection iteration."""
         if isinstance(iter_node, cst.Call) and isinstance(iter_node.func, cst.Name) and iter_node.func.value == "range":
             if len(iter_node.args) == 1:
                 return cst.Integer("0"), iter_node.args[0].value, True
-            elif len(iter_node.args) >= 2:
+            if len(iter_node.args) >= 2:
                 return iter_node.args[0].value, iter_node.args[1].value, True
-        
+
         # Collection iteration (for item in items)
-        bound = cst.Call(
-            func=cst.Name("len"),
-            args=[cst.Arg(value=iter_node)]
-        )
+        bound = cst.Call(func=cst.Name("len"), args=[cst.Arg(value=iter_node)])
         return cst.Integer("0"), bound, False
 
-    def _handle_for(self, body: List, i: int, loop_context=None) -> List:
+    def _handle_for(self, body: list, i: int, loop_context=None) -> list:
         """
         Split at a for-loop whose body contains remote calls.
         """
         for_stmt = body[i]
         pre_loop = body[:i]
-        post_loop = body[i+1:]
+        post_loop = body[i + 1 :]
 
         op_name = self.entities[self.class_name]
 
@@ -203,10 +201,7 @@ class FunctionProcessor:
 
         # Init block: iter_var_name = start_expr
         init_iter = cst.SimpleStatementLine(
-            body=[cst.Assign(
-                targets=[cst.AssignTarget(target=cst.Name(iter_var_name))],
-                value=start_expr
-            )]
+            body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(iter_var_name))], value=start_expr)]
         )
         self.defined_vars.add(iter_var_name)
 
@@ -226,23 +221,15 @@ class FunctionProcessor:
             var_val = state_idx_access
         else:
             var_val = cst.Subscript(
-                value=for_stmt.iter,
-                slice=[cst.SubscriptElement(slice=cst.Index(value=state_idx_access))]
+                value=for_stmt.iter, slice=[cst.SubscriptElement(slice=cst.Index(value=state_idx_access))]
             )
 
         var_assign = cst.SimpleStatementLine(
-            body=[cst.Assign(
-                targets=[cst.AssignTarget(target=cst.Name(loop_var_name))],
-                value=var_val
-            )]
+            body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(loop_var_name))], value=var_val)]
         )
 
         inc_idx = cst.SimpleStatementLine(
-            body=[cst.AugAssign(
-                target=state_idx_access,
-                operator=cst.AddAssign(),
-                value=cst.Integer("1")
-            )]
+            body=[cst.AugAssign(target=state_idx_access, operator=cst.AddAssign(), value=cst.Integer("1"))]
         )
 
         # Snapshot before processing branches
@@ -272,26 +259,20 @@ class FunctionProcessor:
         # Use if/else structure for bounds checking
         loop_condition = cst.Comparison(
             left=state_idx_access,
-            comparisons=[cst.ComparisonTarget(
-                operator=cst.GreaterThanEqual(),
-                comparator=bound_expr
-            )]
+            comparisons=[cst.ComparisonTarget(operator=cst.GreaterThanEqual(), comparator=bound_expr)],
         )
 
         if_block = cst.If(
             test=loop_condition,
             body=cst.IndentedBlock(body=post_loop_body),
-            orelse=cst.Else(
-                body=cst.IndentedBlock(body=[var_assign, inc_idx] + loop_body_processed)
-            )
+            orelse=cst.Else(body=cst.IndentedBlock(body=[var_assign, inc_idx, *loop_body_processed])),
         )
-        loop_step_body = restore_block + [if_block]
+        loop_step_body = [*restore_block, if_block]
 
         cont_func = self._create_continuation(loop_step_name, loop_step_body, "placeholder_return")
         self.generated_functions.append(cont_func)
 
-        return pre_loop + [init_iter] + [direct_call]
-
+        return [*pre_loop, init_iter, direct_call]
 
     def _create_direct_continuation_call(self, func_name: str):
         """
@@ -301,33 +282,38 @@ class FunctionProcessor:
         op_name = self.entities[self.class_name]
 
         context_entries = [
-            cst.DictElement(
-                key=cst.SimpleString(f"'{v}'"),
-                value=cst.Name(v)
-            )
-            for v in sorted(self.defined_vars)
+            cst.DictElement(key=cst.SimpleString(f"'{v}'"), value=cst.Name(v)) for v in sorted(self.defined_vars)
         ]
         context_dict = cst.Dict(elements=context_entries)
 
-        params_tuple = cst.Tuple(elements=[
-            cst.Element(value=context_dict),
-            cst.Element(value=cst.Name("None")),
-            cst.Element(value=cst.Name("reply_to")),
-        ])
-
-        return cst.SimpleStatementLine(
-            body=[cst.Expr(value=cst.Call(
-                func=cst.parse_expression("ctx.call_remote_async"),
-                args=[
-                    cst.Arg(keyword=cst.Name("operator_name"), value=cst.SimpleString(f"'{op_name}'")),
-                    cst.Arg(keyword=cst.Name("function_name"), value=cst.SimpleString(f"'{func_name}'")),
-                    cst.Arg(keyword=cst.Name("key"), value=cst.Attribute(value=cst.Name("ctx"), attr=cst.Name("key"))),
-                    cst.Arg(keyword=cst.Name("params"), value=params_tuple),
-                ]
-            ))]
+        params_tuple = cst.Tuple(
+            elements=[
+                cst.Element(value=context_dict),
+                cst.Element(value=cst.Name("None")),
+                cst.Element(value=cst.Name("reply_to")),
+            ]
         )
 
-    def _any_remote_call(self, stmts: List) -> bool:
+        return cst.SimpleStatementLine(
+            body=[
+                cst.Expr(
+                    value=cst.Call(
+                        func=cst.parse_expression("ctx.call_remote_async"),
+                        args=[
+                            cst.Arg(keyword=cst.Name("operator_name"), value=cst.SimpleString(f"'{op_name}'")),
+                            cst.Arg(keyword=cst.Name("function_name"), value=cst.SimpleString(f"'{func_name}'")),
+                            cst.Arg(
+                                keyword=cst.Name("key"),
+                                value=cst.Attribute(value=cst.Name("ctx"), attr=cst.Name("key")),
+                            ),
+                            cst.Arg(keyword=cst.Name("params"), value=params_tuple),
+                        ],
+                    )
+                )
+            ]
+        )
+
+    def _any_remote_call(self, stmts: list) -> bool:
         """Recursively check if any statement in the list contains a remote call."""
         for stmt in stmts:
             if self._is_remote_call(stmt):
@@ -339,12 +325,10 @@ class FunctionProcessor:
                     if isinstance(stmt.orelse, cst.Else):
                         if self._any_remote_call(list(stmt.orelse.body.body)):
                             return True
-                    elif isinstance(stmt.orelse, cst.If):
-                        if self._any_remote_call([stmt.orelse]):
-                            return True
-            if isinstance(stmt, cst.For):
-                if self._for_contains_remote_call(stmt):
-                    return True
+                    elif isinstance(stmt.orelse, cst.If) and self._any_remote_call([stmt.orelse]):
+                        return True
+            if isinstance(stmt, cst.For) and self._for_contains_remote_call(stmt):
+                return True
         return False
 
     def _if_contains_remote_call(self, node: cst.If) -> bool:
@@ -355,9 +339,8 @@ class FunctionProcessor:
             if isinstance(node.orelse, cst.Else):
                 if self._any_remote_call(list(node.orelse.body.body)):
                     return True
-            elif isinstance(node.orelse, cst.If):
-                if self._if_contains_remote_call(node.orelse):
-                    return True
+            elif isinstance(node.orelse, cst.If) and self._if_contains_remote_call(node.orelse):
+                return True
         return False
 
     def _for_contains_remote_call(self, node: cst.For) -> bool:
@@ -366,7 +349,8 @@ class FunctionProcessor:
 
     # ── Helpers ───────────────────────────────────────────────────────
 
-    def _extract_call_info(self, stmt):
+    @staticmethod
+    def _extract_call_info(stmt):
         element = stmt.body[0]
         if isinstance(element, cst.Assign):
             target_var = element.targets[0].target.value
@@ -375,16 +359,18 @@ class FunctionProcessor:
             target_var = "placeholder_return"
             call_node = element.value
         else:
-            raise ValueError(f"Unexpected element: {type(element)}")
+            msg = f"Unexpected element: {type(element)}"
+            raise ValueError(msg)
 
         if isinstance(call_node.func, cst.Name):
-            receiver = call_node.func 
+            receiver = call_node.func
             remote_method = "create"
         elif isinstance(call_node.func, cst.Attribute):
             receiver = call_node.func.value
             remote_method = call_node.func.attr.value
         else:
-            raise ValueError(f"Unsupported call type: {type(call_node.func)}")
+            msg = f"Unsupported call type: {type(call_node.func)}"
+            raise ValueError(msg)
 
         return target_var, call_node, receiver, remote_method
 
@@ -411,7 +397,7 @@ class FunctionProcessor:
             for s in stmt.body.body:
                 self._track_vars(s)
 
-    def _ends_with_raise(self, body: List) -> bool:
+    def _ends_with_raise(self, body: list) -> bool:
         """Check if the last statement is a raise (making any following code unreachable)."""
         if not body:
             return False
@@ -421,7 +407,6 @@ class FunctionProcessor:
         return False
 
     def _is_remote_call(self, stmt):
-        
         if not isinstance(stmt, cst.SimpleStatementLine) or not stmt.body:
             return False
 
@@ -431,9 +416,9 @@ class FunctionProcessor:
         else:
             return False
 
-        if not isinstance(val, cst.Call): 
+        if not isinstance(val, cst.Call):
             return False
-        
+
         # Case 1: entity initialization, item = Item(name, price)
         if isinstance(val.func, cst.Name):
             return val.func.value in self.entities
@@ -450,7 +435,7 @@ class FunctionProcessor:
         """Check if a CST node's mypy type resolves to an entity."""
         return self._get_entity_type(node) is not None
 
-    def _get_entity_type(self, node) -> str:
+    def _get_entity_type(self, node) -> str | None:
         mypy_type = self.metadata.get(node)
 
         if mypy_type is not None:
@@ -460,9 +445,8 @@ class FunctionProcessor:
             if type_name in self.entities:
                 return type_name
 
-        if isinstance(node, cst.Call) and isinstance(node.func, cst.Name):
-            if node.func.value in self.entities:
-                return node.func.value
+        if isinstance(node, cst.Call) and isinstance(node.func, cst.Name) and node.func.value in self.entities:
+            return node.func.value
 
         return None
 
@@ -476,7 +460,7 @@ class FunctionProcessor:
         if "[" in fullname:
             fullname = fullname.split("[")[0]
         return fullname.rsplit(".", 1)[-1]
-    
+
     def _resolve_operator_name(self, receiver: cst.BaseExpression) -> str:
         # Case: Item() -> receiver is cst.Name(value="Item"), entity constructor
         if isinstance(receiver, cst.Name) and receiver.value in self.entities:
@@ -515,16 +499,11 @@ class FunctionProcessor:
         key_value = self._resolve_key_for_call(receiver, call_node, method)
 
         if not call_node.args:
-            params_value = cst.Tuple(
-                elements=[cst.Element(value=cst.Name("reply_to"))]
-            )
+            params_value = cst.Tuple(elements=[cst.Element(value=cst.Name("reply_to"))])
         else:
             original_args = [arg.value for arg in call_node.args]
 
-            tuple_elements = [
-                cst.Element(value=value)
-                for value in original_args
-            ] + [
+            tuple_elements = [cst.Element(value=value) for value in original_args] + [
                 cst.Element(value=cst.Name("reply_to"))
             ]
 
@@ -546,17 +525,19 @@ class FunctionProcessor:
 
         # remote call becomes an async statement
         async_call = cst.SimpleStatementLine(
-            body=[cst.Expr(
-                value=cst.Call(
-                    func=cst.parse_expression("ctx.call_remote_async"),
-                    args=[
-                        cst.Arg(keyword=cst.Name("operator_name"), value=cst.SimpleString(f"'{op_name}'")),
-                        cst.Arg(keyword=cst.Name("function_name"), value=cst.SimpleString(f"'{method}'")),
-                        cst.Arg(keyword=cst.Name("key"), value=key_value),
-                        cst.Arg(keyword=cst.Name("params"), value=params_value),
-                    ]
+            body=[
+                cst.Expr(
+                    value=cst.Call(
+                        func=cst.parse_expression("ctx.call_remote_async"),
+                        args=[
+                            cst.Arg(keyword=cst.Name("operator_name"), value=cst.SimpleString(f"'{op_name}'")),
+                            cst.Arg(keyword=cst.Name("function_name"), value=cst.SimpleString(f"'{method}'")),
+                            cst.Arg(keyword=cst.Name("key"), value=key_value),
+                            cst.Arg(keyword=cst.Name("params"), value=params_value),
+                        ],
+                    )
                 )
-            )]
+            ]
         )
 
         if next_func_name == "None":
@@ -622,9 +603,7 @@ class FunctionProcessor:
                     cst.Assign(
                         targets=[
                             cst.AssignTarget(
-                                target=cst.Tuple(
-                                    elements=[cst.Element(cst.Name(var)) for var in sorted_vars]
-                                )
+                                target=cst.Tuple(elements=[cst.Element(cst.Name(var)) for var in sorted_vars])
                             )
                         ],
                         value=cst.Tuple(
@@ -633,11 +612,7 @@ class FunctionProcessor:
                                     cst.Subscript(
                                         value=cst.Name("params"),
                                         slice=[
-                                            cst.SubscriptElement(
-                                                slice=cst.Index(
-                                                    value=cst.SimpleString(f"'{var}'")
-                                                )
-                                            )
+                                            cst.SubscriptElement(slice=cst.Index(value=cst.SimpleString(f"'{var}'")))
                                         ],
                                     )
                                 )
@@ -661,16 +636,18 @@ class FunctionProcessor:
             annotation=cst.Annotation(annotation=cst.Name("list")),
             default=cst.Name("None"),
         )
-        
+
         return cst.FunctionDef(
             name=cst.Name(name),
-            params=cst.Parameters(params=[
-                cst.Param(name=cst.Name("ctx"), annotation=cst.Annotation(cst.Name("StatefulFunction"))),
-                cst.Param(name=cst.Name("func_context")),
-                cst.Param(name=cst.Name(target_var), default=cst.Name("None")),
-                reply_to_param,
-            ]),
+            params=cst.Parameters(
+                params=[
+                    cst.Param(name=cst.Name("ctx"), annotation=cst.Annotation(cst.Name("StatefulFunction"))),
+                    cst.Param(name=cst.Name("func_context")),
+                    cst.Param(name=cst.Name(target_var), default=cst.Name("None")),
+                    reply_to_param,
+                ]
+            ),
             body=cst.IndentedBlock(body=body),
             decorators=[deco],
-            asynchronous=cst.Asynchronous()
+            asynchronous=cst.Asynchronous(),
         )

@@ -62,6 +62,13 @@ class User:
         self.myitems.append(item)
         return True
 
+    def drain_stock(self, item: Item) -> int:
+        total = 0
+        while 0 < (item.get_stock() - 1):
+            item.update_stock(-1)
+            total += 1
+        return total
+
     def bulk_purchase_with_tiers(self, cart: list[Item], quantities: list[int]) -> str:
         total_cost = 0
 

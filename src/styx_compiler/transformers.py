@@ -171,15 +171,15 @@ class RemoteCallLinearizer(cst.CSTTransformer):
     Linearizes remote calls within functions.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, entities: dict[str, str] | None = None):
+        self.entities = entities or {}
         self.call_counter = 0
 
     def leave_FunctionDef(self, _original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
         """Process each function and linearize remote calls."""
         self.call_counter = 0
 
-        linearizer = StatementLinearizer()
+        linearizer = StatementLinearizer(self.entities)
         new_body = updated_node.body.visit(linearizer)
 
         return updated_node.with_changes(body=new_body)
@@ -190,8 +190,8 @@ class StatementLinearizer(cst.CSTTransformer):
     Linearize method calls within statements.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, entities: dict[str, str] | None = None):
+        self.entities = entities or {}
         self.counter = 1
 
     def leave_SimpleStatementLine(
@@ -201,7 +201,7 @@ class StatementLinearizer(cst.CSTTransformer):
         new_statements = []
 
         for stmt in updated_node.body:
-            extractor = CallExtractorAndReplacer(self.counter)
+            extractor = CallExtractorAndReplacer(self.entities, self.counter)
             new_stmt = stmt.visit(extractor)
 
             should_collapse = False
@@ -243,7 +243,7 @@ class StatementLinearizer(cst.CSTTransformer):
         """Handle if statements specially."""
         new_statements = []
 
-        extractor = CallExtractorAndReplacer(self.counter)
+        extractor = CallExtractorAndReplacer(self.entities, self.counter)
         new_test = updated_node.test.visit(extractor)
         self.counter = extractor.counter
 
@@ -263,23 +263,74 @@ class StatementLinearizer(cst.CSTTransformer):
 
         return cst.FlattenSentinel(new_statements)
 
+    def leave_While(
+        self, _original_node: cst.While, updated_node: cst.While
+    ) -> cst.While | cst.FlattenSentinel[cst.BaseStatement]:
+        """Handle while statements specially, extracting from test condition."""
+        new_statements = []
+
+        extractor = CallExtractorAndReplacer(self.entities, self.counter)
+        new_test = updated_node.test.visit(extractor)
+        self.counter = extractor.counter
+
+        if not extractor.extracted_calls:
+            return updated_node
+
+        for var_name, call in extractor.extracted_calls:
+            assignment = cst.SimpleStatementLine(
+                body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(var_name))], value=call)]
+            )
+            new_statements.append(assignment)
+
+        new_body_stmts = list(updated_node.body.body)
+        for var_name, call in extractor.extracted_calls:
+            assignment = cst.SimpleStatementLine(
+                body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(var_name))], value=call)]
+            )
+            new_body_stmts.append(assignment)
+
+        new_body = updated_node.body.with_changes(body=new_body_stmts)
+        new_while = updated_node.with_changes(test=new_test, body=new_body)
+        new_statements.append(new_while)
+
+        return cst.FlattenSentinel(new_statements)
+
 
 class CallExtractorAndReplacer(cst.CSTTransformer):
     """
     Extract and replace method calls with variables.
     """
 
-    def __init__(self, start_counter=1):
-        super().__init__()
+    def __init__(self, entities: dict[str, str] | None = None, start_counter=1):
+        self.entities = entities or {}
         self.extracted_calls: list[tuple[str, cst.BaseExpression]] = []
         self.counter = start_counter
 
     def leave_Call(self, _original_node: cst.Call, updated_node: cst.Call) -> cst.BaseExpression:
+        is_entity_instantiation = False
+        if isinstance(updated_node.func, cst.Name) and updated_node.func.value in self.entities:
+            is_entity_instantiation = True
+
+        if is_entity_instantiation:
+            receiver_var_name = f"attr_{self.counter}"
+            self.counter += 1
+            self.extracted_calls.append((receiver_var_name, updated_node))
+            return cst.Name(receiver_var_name)
+
         if isinstance(updated_node.func, cst.Attribute):
             receiver = updated_node.func.value
             new_func = updated_node.func
 
-            if not isinstance(receiver, cst.Name):
+            # Don't extract simple names or self.attribute as receivers
+            is_simple_receiver = False
+            if isinstance(receiver, cst.Name) or (
+                isinstance(receiver, cst.Attribute)
+                and isinstance(receiver.value, cst.Name)
+                and receiver.value.value == "self"
+            ):
+                is_simple_receiver = True
+
+            if not is_simple_receiver:
                 receiver_var_name = f"attr_{self.counter}"
                 self.counter += 1
                 self.extracted_calls.append((receiver_var_name, receiver))

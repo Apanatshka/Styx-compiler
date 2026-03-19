@@ -70,7 +70,11 @@ class FunctionProcessor:
 
             # For-loop with remote calls in body
             if isinstance(stmt, cst.For) and self._for_contains_remote_call(stmt):
-                return self._handle_for(body, i, loop_context)
+                return self._handle_loop(body, i, loop_context)
+
+            # While-loop with remote calls in body
+            if isinstance(stmt, cst.While) and self._while_contains_remote_call(stmt):
+                return self._handle_loop(body, i, loop_context)
 
             self._track_vars(stmt)
 
@@ -180,57 +184,61 @@ class FunctionProcessor:
         bound = cst.Call(func=cst.Name("len"), args=[cst.Arg(value=iter_node)])
         return cst.Integer("0"), bound, False
 
-    def _handle_for(self, body: list, i: int, loop_context=None) -> list:
+    def _handle_loop(self, body: list, i: int, loop_context=None) -> list:
         """
-        Split at a for-loop whose body contains remote calls.
+        Split at a for/while-loop whose body contains remote calls.
         """
-        for_stmt = body[i]
+        loop_stmt = body[i]
         pre_loop = body[:i]
         post_loop = body[i + 1 :]
 
+        is_for = isinstance(loop_stmt, cst.For)
         op_name = self.entities[self.class_name]
-
-        # Current loop level
-        self.loop_iter_counter += 1
-        iter_var_name = f"__loop_index_{self.loop_iter_counter}"
 
         self.split_counter += 1
         loop_step_name = f"{self.original_func.name.value}_step_{self.split_counter}"
 
-        start_expr, bound_expr, is_range = self._parse_loop_iter(for_stmt.iter)
+        # For-loop specific initialization
+        init_iter = None
+        var_assign = None
+        inc_idx = None
+        loop_var_name = "_loop_var"
+        bound_expr = None
+        state_idx_access = None
 
-        # Init block: iter_var_name = start_expr
-        init_iter = cst.SimpleStatementLine(
-            body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(iter_var_name))], value=start_expr)]
-        )
-        self.defined_vars.add(iter_var_name)
+        if is_for:
+            self.loop_iter_counter += 1
+            iter_var_name = f"__loop_index_{self.loop_iter_counter}"
+            start_expr, bound_expr, is_range = self._parse_loop_iter(loop_stmt.iter)
+
+            init_iter = cst.SimpleStatementLine(
+                body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(iter_var_name))], value=start_expr)]
+            )
+            self.defined_vars.add(iter_var_name)
+
+            if isinstance(loop_stmt.target, cst.Name):
+                loop_var_name = loop_stmt.target.value
+
+            state_idx_access = cst.Name(iter_var_name)
+
+            if is_range:
+                var_val = state_idx_access
+            else:
+                var_val = cst.Subscript(
+                    value=loop_stmt.iter, slice=[cst.SubscriptElement(slice=cst.Index(value=state_idx_access))]
+                )
+
+            var_assign = cst.SimpleStatementLine(
+                body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(loop_var_name))], value=var_val)]
+            )
+
+            inc_idx = cst.SimpleStatementLine(
+                body=[cst.AugAssign(target=state_idx_access, operator=cst.AddAssign(), value=cst.Integer("1"))]
+            )
 
         # Direct call to looping part of the function
         direct_call = self._create_direct_continuation_call(loop_step_name)
         restore_block = self._create_restore_block()
-
-        # Determine loop variable name and type (but don't add to defined_vars yet)
-        loop_var_name = "_loop_var"
-        if isinstance(for_stmt.target, cst.Name):
-            loop_var_name = for_stmt.target.value
-
-        # Generate assignment for the loop var and increment
-        state_idx_access = cst.Name(iter_var_name)
-
-        if is_range:
-            var_val = state_idx_access
-        else:
-            var_val = cst.Subscript(
-                value=for_stmt.iter, slice=[cst.SubscriptElement(slice=cst.Index(value=state_idx_access))]
-            )
-
-        var_assign = cst.SimpleStatementLine(
-            body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(loop_var_name))], value=var_val)]
-        )
-
-        inc_idx = cst.SimpleStatementLine(
-            body=[cst.AugAssign(target=state_idx_access, operator=cst.AddAssign(), value=cst.Integer("1"))]
-        )
 
         # Snapshot before processing branches
         saved_vars = self.defined_vars.copy()
@@ -244,35 +252,40 @@ class FunctionProcessor:
         # Restore before processing loop body (independent path)
         self.defined_vars = saved_vars.copy()
 
-        # Track loop variable for the loop body
-        if loop_var_name != "_loop_var":
+        if is_for and loop_var_name != "_loop_var":
             self.defined_vars.add(loop_var_name)
 
         # Process loop body in loop mode
-        inner_loop_context = (loop_step_name, op_name, iter_var_name)
-        loop_body_stmts = list(for_stmt.body.body)
+        inner_loop_context = (loop_step_name, op_name, state_idx_access.value if is_for else None)
+        loop_body_stmts = list(loop_stmt.body.body)
         loop_body_processed = self._split_body(loop_body_stmts, inner_loop_context)
 
         # Restore to pre-branch state
         self.defined_vars = saved_vars
 
-        # Use if/else structure for bounds checking
-        loop_condition = cst.Comparison(
-            left=state_idx_access,
-            comparisons=[cst.ComparisonTarget(operator=cst.GreaterThanEqual(), comparator=bound_expr)],
-        )
+        if is_for:
+            # Use if/else structure for bounds checking
+            test_cond = cst.Comparison(
+                left=state_idx_access,
+                comparisons=[cst.ComparisonTarget(operator=cst.GreaterThanEqual(), comparator=bound_expr)],
+            )
+            body_block = cst.IndentedBlock(body=post_loop_body)
+            else_block = cst.Else(body=cst.IndentedBlock(body=[var_assign, inc_idx, *loop_body_processed]))
+        else:
+            # Use if/else structure for condition checking
+            test_cond = loop_stmt.test
+            body_block = cst.IndentedBlock(body=loop_body_processed)
+            else_block = cst.Else(body=cst.IndentedBlock(body=post_loop_body))
 
-        if_block = cst.If(
-            test=loop_condition,
-            body=cst.IndentedBlock(body=post_loop_body),
-            orelse=cst.Else(body=cst.IndentedBlock(body=[var_assign, inc_idx, *loop_body_processed])),
-        )
+        if_block = cst.If(test=test_cond, body=body_block, orelse=else_block)
         loop_step_body = [*restore_block, if_block]
 
         cont_func = self._create_continuation(loop_step_name, loop_step_body, "placeholder_return")
         self.generated_functions.append(cont_func)
 
-        return [*pre_loop, init_iter, direct_call]
+        if is_for:
+            return [*pre_loop, init_iter, direct_call]
+        return [*pre_loop, direct_call]
 
     def _create_direct_continuation_call(self, func_name: str):
         """
@@ -321,13 +334,14 @@ class FunctionProcessor:
             if isinstance(stmt, cst.If):
                 if self._any_remote_call(list(stmt.body.body)):
                     return True
-                if stmt.orelse is not None:
-                    if isinstance(stmt.orelse, cst.Else):
-                        if self._any_remote_call(list(stmt.orelse.body.body)):
-                            return True
-                    elif isinstance(stmt.orelse, cst.If) and self._any_remote_call([stmt.orelse]):
-                        return True
+                if stmt.orelse is not None and (
+                    (isinstance(stmt.orelse, cst.Else) and self._any_remote_call(list(stmt.orelse.body.body)))
+                    or (isinstance(stmt.orelse, cst.If) and self._any_remote_call([stmt.orelse]))
+                ):
+                    return True
             if isinstance(stmt, cst.For) and self._for_contains_remote_call(stmt):
+                return True
+            if isinstance(stmt, cst.While) and self._while_contains_remote_call(stmt):
                 return True
         return False
 
@@ -345,6 +359,10 @@ class FunctionProcessor:
 
     def _for_contains_remote_call(self, node: cst.For) -> bool:
         """Check if a For loop's body contains remote calls."""
+        return self._any_remote_call(list(node.body.body))
+
+    def _while_contains_remote_call(self, node: cst.While) -> bool:
+        """Check if a While loop's body contains remote calls."""
         return self._any_remote_call(list(node.body.body))
 
     # ── Helpers ───────────────────────────────────────────────────────
@@ -394,6 +412,9 @@ class FunctionProcessor:
         elif isinstance(stmt, cst.For):
             if isinstance(stmt.target, cst.Name):
                 self.defined_vars.add(stmt.target.value)
+            for s in stmt.body.body:
+                self._track_vars(s)
+        elif isinstance(stmt, cst.While):
             for s in stmt.body.body:
                 self._track_vars(s)
 

@@ -296,7 +296,7 @@ class StyxTranspiler:
         print(f"Entity Init Params: {self.entity_init_params}")
 
         # 2. Linearize
-        linearizer = RemoteCallLinearizer()
+        linearizer = RemoteCallLinearizer(self.entities)
         linearized_tree = self.cst_tree.visit(linearizer)
         linearized_code = linearized_tree.code
 

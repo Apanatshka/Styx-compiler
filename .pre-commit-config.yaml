@@ -26,8 +26,10 @@ repos:
       - id: ruff
         types_or: [python, pyi, jupyter]
         args: [--fix, --show-fixes]
+        exclude: ^examples/
       # then, format
       - id: ruff-format
+        exclude: ^examples/
 
   - repo: https://github.com/lyz-code/yamlfix
     rev: 1.19.1

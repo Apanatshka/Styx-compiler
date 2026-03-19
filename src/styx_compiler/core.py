@@ -321,7 +321,7 @@ class StyxTranspiler:
         The metadata_dict maps cst.CSTNode -> MypyType.
         """
         # Prepend so mypy does not fail
-        stubs = "def entity(cls): return cls\nclass logging:\n    @staticmethod\n    def warn(msg): pass\n"
+        stubs = "def entity(cls): return cls\nclass logging:\n    @staticmethod\n    def warning(msg): pass\n"
         full_code = stubs + source_code
 
         # Write to temp file for mypy to analyze
@@ -359,7 +359,7 @@ class StyxTranspiler:
 
 
 # Main execution
-if __name__ == "__main__":
+def main():
     file_name = "user_item.py"
     input_file = "./examples/original/" + file_name
     output_file = "./examples/compiled/" + file_name

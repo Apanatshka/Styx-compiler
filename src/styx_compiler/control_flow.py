@@ -161,7 +161,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
     def _visit_statement(
         self,
         statement: cst.BaseStatement | cst.BaseSmallStatement,
-        number: int,
+        instance: int,
         prev: list[CfgNode],
         fn_end: CfgNode,
         exception_target: CfgNode,
@@ -173,30 +173,30 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             statement: cst.AnnAssign = cst.ensure_type(statement, cst.AnnAssign)
             # RHS first if it exists
             if statement.value is not None:
-                prev = self._visit_expression(statement.value, number, prev)
+                prev = self._visit_expression(statement.value, instance, prev)
             # LHS
-            prev = self._visit_expression(statement.target, number, prev)
+            prev = self._visit_expression(statement.target, instance, prev)
         elif m.matches(statement, m.Assert()):
             statement: cst.Assert = cst.ensure_type(statement, cst.Assert)
             # test expression first?
-            prev = self._visit_expression(statement.test, number, prev)
+            prev = self._visit_expression(statement.test, instance, prev)
             # then message
-            prev = self._visit_expression(statement.msg, number, prev)
+            prev = self._visit_expression(statement.msg, instance, prev)
         elif m.matches(statement, m.Assign()):
             statement: cst.Assign = cst.ensure_type(statement, cst.Assign)
             # RHS first
-            prev = self._visit_expression(statement.value, number, prev)
+            prev = self._visit_expression(statement.value, instance, prev)
             # then the multiple LHS, from left to right
             for target in statement.targets:
-                prev = self._make_cfg_node(target, number, prev)  # AssignTarget
+                prev = self._make_cfg_node(target, instance, prev)  # AssignTarget
         elif m.matches(statement, m.AugAssign()):
             statement: cst.AugAssign = cst.ensure_type(statement, cst.AugAssign)
             # note we're making the AugAssign a node first to represent reading the value from the target
-            prev = self._make_cfg_node(statement, number, prev)  # AugAssign
+            prev = self._make_cfg_node(statement, instance, prev)  # AugAssign
             # then we visit the RHS expression to find more reads
-            prev = self._visit_expression(statement.value, number, prev)
+            prev = self._visit_expression(statement.value, instance, prev)
             # finally we write to the LHS
-            prev = self._visit_expression(statement.target, number, prev)
+            prev = self._visit_expression(statement.target, instance, prev)
         elif m.matches(statement, m.Break()):
             if loop_break_target is None:
                 msg = "Found break outside of loop"
@@ -211,42 +211,42 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             prev = []
         elif m.matches(statement, m.Del()):
             statement: cst.Del = cst.ensure_type(statement, cst.Del)
-            prev = self._visit_expression(statement.target, number, prev)
+            prev = self._visit_expression(statement.target, instance, prev)
         elif m.matches(statement, m.Expr()):
             statement: cst.Expr = cst.ensure_type(statement, cst.Expr)
-            prev = self._visit_expression(statement.value, number, prev)
+            prev = self._visit_expression(statement.value, instance, prev)
         elif m.matches(statement, m.Global()):
             statement: cst.Global = cst.ensure_type(statement, cst.Global)
             for name in statement.names:
-                prev = self._make_cfg_node(name, number, prev)  # NameItem
+                prev = self._make_cfg_node(name, instance, prev)  # NameItem
         elif m.matches(statement, m.Import()):
             statement: cst.Import = cst.ensure_type(statement, cst.Import)
             for name in statement.names:
-                prev = self._visit_ImportAlias(name, number, prev)
+                prev = self._visit_ImportAlias(name, instance, prev)
         elif m.matches(statement, m.ImportFrom()):
             statement: cst.ImportFrom = cst.ensure_type(statement, cst.ImportFrom)
             if statement.module is not None:
-                prev = self._make_cfg_node(statement.module, number, prev)  # Attribute | Name
+                prev = self._make_cfg_node(statement.module, instance, prev)  # Attribute | Name
             if not m.matches(statement.names, m.ImportStar()):
                 for name in statement.names:
-                    prev = self._visit_ImportAlias(name, number, prev)
+                    prev = self._visit_ImportAlias(name, instance, prev)
         elif m.matches(statement, m.Nonlocal()):
             statement: cst.Nonlocal = cst.ensure_type(statement, cst.Nonlocal)
             for name in statement.names:
-                prev = self._make_cfg_node(name, number, prev)  # NameItem
+                prev = self._make_cfg_node(name, instance, prev)  # NameItem
         elif m.matches(statement, m.Pass()):
             pass
         elif m.matches(statement, m.Raise()):
             statement: cst.Raise = cst.ensure_type(statement, cst.Raise)
             if statement.exc is not None:
-                prev = self._visit_expression(statement.exc, number, prev)
+                prev = self._visit_expression(statement.exc, instance, prev)
             if statement.cause is not None:
-                prev = self._visit_expression(statement.cause.item, number, prev)
+                prev = self._visit_expression(statement.cause.item, instance, prev)
             self._edge(prev, exception_target)
             prev = []
         elif m.matches(statement, m.Return()):
             statement: cst.Return = cst.ensure_type(statement, cst.Return)
-            prev = self._visit_expression(statement.value, number, prev)
+            prev = self._visit_expression(statement.value, instance, prev)
             self._edge(prev, fn_end)
             prev = []
         ## Compound Statements
@@ -258,12 +258,12 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             index = self.get_metadata(IndexProvider, statement)
             for_loop_continue_target = Ghost(index, 0)
             prev = self._edge(prev, for_loop_continue_target)
-            loop_expr_prev = self._visit_expression(statement.iter, number, prev)
+            loop_expr_prev = self._visit_expression(statement.iter, instance, prev)
             prev = loop_expr_prev
-            prev = self._visit_expression(statement.target, number, prev)
+            prev = self._visit_expression(statement.target, instance, prev)
             prev = self._visit_loop(
                 statement,
-                number,
+                instance,
                 prev,
                 index,
                 for_loop_continue_target,
@@ -277,10 +277,10 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             raise NotImplementedError(msg)
         elif m.matches(statement, m.If()):
             statement: cst.If = cst.ensure_type(statement, cst.If)
-            prev = self._visit_expression(statement.test, number, prev)
+            prev = self._visit_expression(statement.test, instance, prev)
             body = self._visit_BaseSuite(
                 statement.body,
-                number,
+                instance,
                 prev,
                 fn_end=fn_end,
                 exception_target=exception_target,
@@ -293,7 +293,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 orelse: cst.Else = cst.ensure_type(statement.orelse, cst.Else)
                 prev = self._visit_BaseSuite(
                     orelse.body,
-                    number,
+                    instance,
                     prev,
                     fn_end=fn_end,
                     exception_target=exception_target,
@@ -304,7 +304,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 orelse: cst.If = cst.ensure_type(statement.orelse, cst.If)
                 prev = self._visit_statement(
                     orelse,
-                    number,
+                    instance,
                     prev,
                     fn_end=fn_end,
                     exception_target=exception_target,
@@ -314,7 +314,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             prev = [*body, *prev]
         elif m.matches(statement, m.Try()):
             statement: cst.Try = cst.ensure_type(statement, cst.Try)
-            finally_number = number
+            finally_number = instance
 
             def wrap_in_finally(exit: CfgNode) -> CfgNode:
                 nonlocal statement, finally_number, fn_end, exception_target, loop_continue_target, loop_break_target
@@ -354,16 +354,16 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 handler_entries.append(handler_entry)
                 if len(handler_cond) > 0:
                     self._edge(handler_cond[-1], handler_entry)
-                handler_prev = self._visit_expression(handler.type, number, [handler_entry])
+                handler_prev = self._visit_expression(handler.type, instance, [handler_entry])
                 handler_cond.append(handler_prev)
                 self._edge(handler_prev, handler_exit)
                 handler_exits.append(handler_exit)
 
                 if handler.name is not None:
-                    handler_prev = self._make_cfg_node(handler.name, number, handler_prev)  # AsName
+                    handler_prev = self._make_cfg_node(handler.name, instance, handler_prev)  # AsName
                 handler_prev = self._visit_BaseSuite(
                     handler.body,
-                    number,
+                    instance,
                     handler_prev,
                     fn_end=local_fn_end,
                     exception_target=local_exception_target,
@@ -374,7 +374,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             # Try body first, using the handler chain as exception target and the finally-wrapped other targets
             prev = self._visit_BaseSuite(
                 statement.body,
-                number,
+                instance,
                 prev,
                 fn_end=local_fn_end,
                 exception_target=handler_entries[0] if len(handler_entries) > 0 else local_exception_target,
@@ -396,7 +396,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 orelse: cst.Else = cst.ensure_type(statement.orelse, cst.Else)
                 prev = self._visit_BaseSuite(
                     orelse.body,
-                    number,
+                    instance,
                     prev,
                     fn_end=local_fn_end,
                     exception_target=local_exception_target,
@@ -414,10 +414,10 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             index = self.get_metadata(IndexProvider, statement)
             while_loop_continue_target = Ghost(index, 0)
             prev = self._edge(prev, while_loop_continue_target)
-            prev = self._visit_expression(statement.test, number, prev)
+            prev = self._visit_expression(statement.test, instance, prev)
             prev = self._visit_loop(
                 statement,
-                number,
+                instance,
                 prev,
                 index,
                 while_loop_continue_target,
@@ -429,12 +429,12 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
         elif m.matches(statement, m.With()):
             statement: cst.With = cst.ensure_type(statement, cst.With)
             for item in statement.items:
-                prev = self._visit_expression(item.item, number, prev)
+                prev = self._visit_expression(item.item, instance, prev)
                 if item.asname is not None:
-                    prev = self._make_cfg_node(item.asname, number, prev)  # AsName
+                    prev = self._make_cfg_node(item.asname, instance, prev)  # AsName
             prev = self._visit_BaseSuite(
                 statement.body,
-                number,
+                instance,
                 prev,
                 fn_end=fn_end,
                 exception_target=exception_target,
@@ -449,7 +449,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 statement: cst.BaseSuite = cst.ensure_type(statement, cst.BaseSuite)
             prev = self._visit_BaseSuite(
                 statement,
-                number,
+                instance,
                 prev,
                 fn_end=fn_end,
                 exception_target=exception_target,
@@ -465,7 +465,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
     def _visit_loop(
         self,
         statement: cst.For | cst.While,
-        number: int,
+        instance: int,
         prev: list[CfgNode],
         index: int,
         this_loop_continue_target: Ghost,
@@ -477,7 +477,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
         this_loop_break_target = Ghost(index, 1)
         prev = self._visit_BaseSuite(
             statement.body,
-            number,
+            instance,
             prev,
             fn_end=fn_end,
             exception_target=exception_target,
@@ -488,7 +488,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             orelse: cst.Else = cst.ensure_type(statement.orelse, cst.Else)
             prev = self._visit_BaseSuite(
                 orelse.body,
-                number,
+                instance,
                 prev,
                 fn_end=fn_end,
                 exception_target=exception_target,
@@ -497,52 +497,52 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             )
         return self._edge(prev, this_loop_break_target)
 
-    def _visit_expression(self, expression: cst.BaseExpression, number: int, prev: list[CfgNode]) -> list[CfgNode]:
+    def _visit_expression(self, expression: cst.BaseExpression, instance: int, prev: list[CfgNode]) -> list[CfgNode]:
         ## Names and Object Attributes
         if m.matches(expression, m.Name()):
-            prev = self._make_cfg_node(expression, number, prev)  # Name
+            prev = self._make_cfg_node(expression, instance, prev)  # Name
         elif m.matches(expression, m.Attribute()):
             expression: cst.Attribute = cst.ensure_type(expression, cst.Attribute)
-            prev = self._visit_expression(expression.value, number, prev)
-            prev = self._make_cfg_node(expression, number, prev)  # Attribute
+            prev = self._visit_expression(expression.value, instance, prev)
+            prev = self._make_cfg_node(expression, instance, prev)  # Attribute
         ## Operations and Comparisons
         elif m.matches(expression, m.UnaryOperation()):
             expression: cst.UnaryOperation = cst.ensure_type(expression, cst.UnaryOperation)
-            prev = self._visit_expression(expression.expression, number, prev)
-            prev = self._make_cfg_node(expression.expression, number, prev)  # UnaryOperation
+            prev = self._visit_expression(expression.expression, instance, prev)
+            prev = self._make_cfg_node(expression.expression, instance, prev)  # UnaryOperation
         elif m.matches(expression, m.BinaryOperation() | m.BooleanOperation()):
             expression: cst.BinaryOperation = cst.ensure_type(expression, cst.BinaryOperation)
-            prev = self._visit_expression(expression.left, number, prev)
-            prev = self._visit_expression(expression.right, number, prev)
-            prev = self._make_cfg_node(expression, number, prev)  # BinaryOperation, BooleanOperation
+            prev = self._visit_expression(expression.left, instance, prev)
+            prev = self._visit_expression(expression.right, instance, prev)
+            prev = self._make_cfg_node(expression, instance, prev)  # BinaryOperation, BooleanOperation
         elif m.matches(expression, m.Comparison()):
             # noinspection DuplicatedCode
             expression: cst.Comparison = cst.ensure_type(expression, cst.Comparison)
-            prev = self._visit_expression(expression.left, number, prev)
+            prev = self._visit_expression(expression.left, instance, prev)
             for comparison in expression.comparisons:
-                prev = self._visit_expression(comparison.comparator, number, prev)
-                prev = self._make_cfg_node(comparison, number, prev)  # ComparisonTarget
+                prev = self._visit_expression(comparison.comparator, instance, prev)
+                prev = self._make_cfg_node(comparison, instance, prev)  # ComparisonTarget
         ## Control Flow
         elif m.matches(expression, m.Await()):
             expression: cst.Await = cst.ensure_type(expression, cst.Await)
-            prev = self._visit_expression(expression.expression, number, prev)
-            prev = self._make_cfg_node(expression, number, prev)  # Await
+            prev = self._visit_expression(expression.expression, instance, prev)
+            prev = self._make_cfg_node(expression, instance, prev)  # Await
         elif m.matches(expression, m.Yield()):
             expression: cst.Yield = cst.ensure_type(expression, cst.Yield)
-            prev = self._visit_expression(expression.value, number, prev)
+            prev = self._visit_expression(expression.value, instance, prev)
             # yield is not like return. A later call to the generator will continue from the yield, so
             #  in the CFG we're just going to represent it as a normal node and pretend the control did
             #  not leave and re-enter because it probably doesn't matter for the analyses we want to do.
-            prev = self._make_cfg_node(expression, number, prev)  # Yield
+            prev = self._make_cfg_node(expression, instance, prev)  # Yield
         elif m.matches(expression, m.From()):
             expression: cst.From = cst.ensure_type(expression, cst.From)
-            prev = self._visit_expression(expression.item, number, prev)
-            prev = self._make_cfg_node(expression, number, prev)  # From
+            prev = self._visit_expression(expression.item, instance, prev)
+            prev = self._make_cfg_node(expression, instance, prev)  # From
         elif m.matches(expression, m.IfExp()):
             expression: cst.IfExp = cst.ensure_type(expression, cst.IfExp)
-            prev = self._visit_expression(expression.test, number, prev)
-            body = self._visit_expression(expression.body, number, prev)
-            orelse = self._visit_expression(expression.orelse, number, prev)
+            prev = self._visit_expression(expression.test, instance, prev)
+            body = self._visit_expression(expression.body, instance, prev)
+            orelse = self._visit_expression(expression.orelse, instance, prev)
             prev = [*body, *orelse]
         ## Lambdas and Function Calls
         elif m.matches(expression, m.Lambda()):
@@ -550,85 +550,85 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             raise NotImplementedError(msg)
         elif m.matches(expression, m.Call()):
             expression: cst.Call = cst.ensure_type(expression, cst.Call)
-            prev = self._visit_expression(expression.func, number, prev)
+            prev = self._visit_expression(expression.func, instance, prev)
             for arg in expression.args:
-                prev = self._visit_expression(arg.value, number, prev)
+                prev = self._visit_expression(arg.value, instance, prev)
         ## Literal Values
         elif m.matches(expression, m.Ellipsis()):
             pass
         elif m.matches(expression, m.Integer() | m.Float() | m.Imaginary() | m.SimpleString() | m.ConcatenatedString()):
             prev = self._make_cfg_node(
-                expression, number, prev
+                expression, instance, prev
             )  # Integer, Float, Imaginary, SimpleString, ConcatenatedString
         elif m.matches(expression, m.FormattedString()):
             expression: cst.FormattedString = cst.ensure_type(expression, cst.FormattedString)
             for part in expression.parts:
                 if m.matches(part, m.FormattedStringExpression()):
                     part: cst.FormattedStringExpression = cst.ensure_type(part, cst.FormattedStringExpression)  # noqa: PLW2901
-                    prev = self._visit_expression(part.expression, number, prev)
-                    prev = self._make_cfg_node(part, number, prev)  # FormattedStringExpression
-            prev = self._make_cfg_node(expression, number, prev)  # FormattedString
+                    prev = self._visit_expression(part.expression, instance, prev)
+                    prev = self._make_cfg_node(part, instance, prev)  # FormattedStringExpression
+            prev = self._make_cfg_node(expression, instance, prev)  # FormattedString
         ## Collections
         elif m.matches(expression, m.Tuple() | m.List() | m.Set()):
             # noinspection PyUnresolvedReferences
-            prev = self._visit_elements(expression.elements, number, prev)
-            prev = self._make_cfg_node(expression, number, prev)  # Tuple, List, Set
+            prev = self._visit_elements(expression.elements, instance, prev)
+            prev = self._make_cfg_node(expression, instance, prev)  # Tuple, List, Set
         elif m.matches(expression, m.Element() | m.StarredElement()):
             # noinspection PyUnresolvedReferences
-            prev = self._visit_expression(expression.value, number, prev)
-            prev = self._make_cfg_node(expression, number, prev)  # Element, StarredElement
+            prev = self._visit_expression(expression.value, instance, prev)
+            prev = self._make_cfg_node(expression, instance, prev)  # Element, StarredElement
         elif m.matches(expression, m.Dict()):
             expression: cst.Dict = cst.ensure_type(expression, cst.Dict)
             for element in expression.elements:
                 if m.matches(element, m.DictElement()):
                     element: cst.DictElement = cst.ensure_type(element, cst.DictElement)  # noqa: PLW2901
-                    prev = self._visit_expression(element.key, number, prev)
-                prev = self._visit_expression(element.value, number, prev)
-                prev = self._make_cfg_node(element, number, prev)  # DictElement, StarredDictElement
+                    prev = self._visit_expression(element.key, instance, prev)
+                prev = self._visit_expression(element.value, instance, prev)
+                prev = self._make_cfg_node(element, instance, prev)  # DictElement, StarredDictElement
         ## Comprehensions
         elif m.matches(expression, m.GeneratorExp() | m.ListComp() | m.SetComp()):
             expression: cst.BaseSimpleComp = cst.ensure_type(expression, cst.BaseSimpleComp)
-            prev = self._visit_CompFor(expression.for_in, number, expression.elt, prev)
-            prev = self._make_cfg_node(expression, number, prev)  # GeneratorExp, ListComp, SetComp
+            prev = self._visit_CompFor(expression.for_in, instance, expression.elt, prev)
+            prev = self._make_cfg_node(expression, instance, prev)  # GeneratorExp, ListComp, SetComp
         elif m.matches(expression, m.DictComp()):
             expression: cst.DictComp = cst.ensure_type(expression, cst.DictComp)
-            prev = self._visit_CompFor(expression.for_in, number, (expression.key, expression.value), prev)
-            prev = self._make_cfg_node(expression, number, prev)  # DictComp
+            prev = self._visit_CompFor(expression.for_in, instance, (expression.key, expression.value), prev)
+            prev = self._make_cfg_node(expression, instance, prev)  # DictComp
         ## Subscripts and Slices
         elif m.matches(expression, m.Subscript()):
             expression: cst.Subscript = cst.ensure_type(expression, cst.Subscript)
-            prev = self._visit_expression(expression.value, number, prev)
+            prev = self._visit_expression(expression.value, instance, prev)
             for element in expression.slice:
                 if m.matches(element, m.Index()):
                     element: cst.Index = cst.ensure_type(element, cst.Index)  # noqa: PLW2901
-                    prev = self._visit_expression(element.value, number, prev)
-                    prev = self._make_cfg_node(element, number, prev)  # Index
+                    prev = self._visit_expression(element.value, instance, prev)
+                    prev = self._make_cfg_node(element, instance, prev)  # Index
                 elif m.matches(element, m.Slice()):
                     element: cst.Slice = cst.ensure_type(element, cst.Slice)  # noqa: PLW2901
-                    prev = self._visit_expression(element.lower, number, prev)
-                    prev = self._visit_expression(element.upper, number, prev)
-                    prev = self._visit_expression(element.step, number, prev)
-                    prev = self._make_cfg_node(element, number, prev)  # Slice
+                    prev = self._visit_expression(element.lower, instance, prev)
+                    prev = self._visit_expression(element.upper, instance, prev)
+                    prev = self._visit_expression(element.step, instance, prev)
+                    prev = self._make_cfg_node(element, instance, prev)  # Slice
                 else:
                     msg = f"Unknown subscript element type {element}"
                     raise RuntimeError(msg)
-            prev = self._make_cfg_node(expression, number, prev)  # Subscript
+            prev = self._make_cfg_node(expression, instance, prev)  # Subscript
         else:
             msg = f"Unknown expression type {expression}"
             raise RuntimeError(msg)
         return prev
 
-    def _visit_ImportAlias(self, import_alias: cst.ImportAlias, number: int, prev: list[CfgNode]) -> list[CfgNode]:
-        prev = self._make_cfg_node(import_alias.name, number, prev)  # Attribute, Name
+    def _visit_ImportAlias(self, import_alias: cst.ImportAlias, instance: int, prev: list[CfgNode]) -> list[CfgNode]:
+        prev = self._make_cfg_node(import_alias.name, instance, prev)  # Attribute, Name
         if import_alias.asname is not None:
-            prev = self._make_cfg_node(import_alias.asname, number, prev)  # AsName
+            prev = self._make_cfg_node(import_alias.asname, instance, prev)  # AsName
         return prev
 
-    def _visit_elements(self, elements: Sequence[cst.BaseElement], number: int, prev: list[CfgNode]) -> list[CfgNode]:
+    def _visit_elements(self, elements: Sequence[cst.BaseElement], instance: int, prev: list[CfgNode]) -> list[CfgNode]:
         for element in elements:
             if m.matches(element, m.Element() | m.StarredElement()):
-                prev = self._visit_expression(element.value, number, prev)
-                prev = self._make_cfg_node(element, number, prev)  # Element, StarredElement
+                prev = self._visit_expression(element.value, instance, prev)
+                prev = self._make_cfg_node(element, instance, prev)  # Element, StarredElement
             else:
                 msg = f"Unknown element type {element}"
                 raise RuntimeError(msg)
@@ -637,23 +637,214 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
     def _visit_CompFor(
         self,
         for_in: cst.CompFor,
-        number: int,
+        instance: int,
         elt: cst.BaseExpression | tuple[cst.BaseExpression, cst.BaseExpression],
         prev: list[CfgNode],
     ) -> list[CfgNode]:
         exit = Ghost(self.get_metadata(IndexProvider, for_in), 0)
-        prev = self._visit_expression(for_in.iter, number, prev)
-        prev = self._visit_expression(for_in.target, number, prev)
+        prev = self._visit_expression(for_in.iter, instance, prev)
+        prev = self._visit_expression(for_in.target, instance, prev)
         for compif in for_in.ifs:
-            prev = self._visit_expression(compif.test, number, prev)
+            prev = self._visit_expression(compif.test, instance, prev)
             self._edge(prev, exit)
         if for_in.inner_for_in is not None:
-            prev = self._visit_CompFor(for_in.inner_for_in, number, elt, prev)
+            prev = self._visit_CompFor(for_in.inner_for_in, instance, elt, prev)
         else:
             if isinstance(elt, tuple):
                 key, value = elt
-                prev = self._visit_expression(key, number, prev)
-                prev = self._visit_expression(value, number, prev)
+                prev = self._visit_expression(key, instance, prev)
+                prev = self._visit_expression(value, instance, prev)
             else:
-                prev = self._visit_expression(elt, number, prev)
+                prev = self._visit_expression(elt, instance, prev)
         return self._edge(prev, exit)
+
+
+class CfgNodeTester(cst.CSTVisitor):
+    """
+    Checks that each kind of CST Node that should have a corresponding CFG node has one
+    """
+
+    METADATA_DEPENDENCIES = (IndexProvider,)
+
+    def __init__(self, cfg: dict[Node, set[Node]]):
+        super().__init__()
+        self.cfg = cfg
+        self.active = False
+
+    def _has_node(self, node: cst.CSTNode, instance: int = 0) -> bool:
+        """
+        Tests if the CSTNode has a corresponding CFG node with outgoing edges
+        """
+        n = Node(self.get_metadata(IndexProvider, node), instance)
+        return n in self.cfg
+
+    def visit_Param(self, node: cst.Param) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+            # TODO: should we visit deeper into Param too?
+            return False
+        return None
+
+    def visit_AssignTarget(self, node: cst.AssignTarget) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+            # TODO: should we visit deeper into AssignTarget too?
+            return False
+        return None
+
+    def visit_AugAssign(self, node: cst.AugAssign) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_NameItem(self, node: cst.NameItem) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Attribute(self, node: cst.Attribute) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+            # TODO: should we visit deeper into Attribute too?
+            return False
+        return None
+
+    def visit_Name(self, node: cst.Name) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_AsName(self, node: cst.AsName) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_UnaryOperation(self, node: cst.UnaryOperation) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_BinaryOperation(self, node: cst.BinaryOperation) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_BooleanOperation(self, node: cst.BooleanOperation) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_ComparisonTarget(self, node: cst.ComparisonTarget) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Await(self, node: cst.Await) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Yield(self, node: cst.Yield) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_From(self, node: cst.From) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Integer(self, node: cst.Integer) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Float(self, node: cst.Float) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Imaginary(self, node: cst.Imaginary) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_SimpleString(self, node: cst.SimpleString) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_ConcatenatedString(self, node: cst.ConcatenatedString) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_FormattedStringExpression(self, node: cst.FormattedStringExpression) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_FormattedString(self, node: cst.FormattedString) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Tuple(self, node: cst.Tuple) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_List(self, node: cst.List) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Set(self, node: cst.Set) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Element(self, node: cst.Element) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_StarredElement(self, node: cst.StarredElement) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_DictElement(self, node: cst.DictElement) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_StarredDictElement(self, node: cst.StarredDictElement) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_GeneratorExp(self, node: cst.GeneratorExp) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_ListComp(self, node: cst.ListComp) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_SetComp(self, node: cst.SetComp) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_DictComp(self, node: cst.DictComp) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Index(self, node: cst.Index) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Slice(self, node: cst.Slice) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_Subscript(self, node: cst.Subscript) -> bool | None:
+        if self.active:
+            assert self._has_node(node)
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool | None:
+        assert self._has_node(node)
+        # We're not testing for instance 1, which is a final node and will not have outgoing edges
+
+    def visit_FunctionDef_params(self, _node: cst.FunctionDef) -> None:
+        self.active = True
+
+    def leave_FunctionDef_params(self, _node: cst.FunctionDef) -> None:
+        self.active = False
+
+    def visit_FunctionDef_body(self, _node: cst.FunctionDef) -> None:
+        self.active = True
+
+    def leave_FunctionDef_body(self, _node: cst.FunctionDef) -> None:
+        self.active = False
+
+    def visit_AnnAssign_annotation(self, _node: cst.FunctionDef) -> None:
+        self.active = False
+
+    def leave_AnnAssign_annotation(self, _node: cst.FunctionDef) -> None:
+        self.active = True

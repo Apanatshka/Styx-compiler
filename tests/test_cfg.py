@@ -2,7 +2,7 @@
 
 import libcst as cst
 
-from styx_compiler.control_flow import ComputeControlFlowGraph
+from styx_compiler.control_flow import CfgNodeTester, ComputeControlFlowGraph
 
 add_fundef = """
 def add(a: int, b: int) -> int:
@@ -92,3 +92,18 @@ def test_nested_try_cfg():
     print(ccfg._cfg)
     assert len(ccfg._cfg) > 0
     print(sum(1 for v in ccfg._cfg.values() if len(v) > 1))
+
+
+def test_node_existence():
+    node_existence(add_fundef)
+    node_existence(user_item)
+    node_existence(nested_try)
+
+
+def node_existence(source_string: str):
+    source_tree = cst.parse_module(source_string)
+    wrapper = cst.MetadataWrapper(source_tree)
+    ccfg = ComputeControlFlowGraph()
+    wrapper.visit(ccfg)
+    cnt = CfgNodeTester(ccfg._cfg)
+    wrapper.visit(cnt)

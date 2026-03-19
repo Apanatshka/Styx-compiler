@@ -18,11 +18,11 @@ class Node:
     """
     A node in the control flow graph
 
-    Uses an index from the IndexProvider to tie it to the CST, and an extra number to make multiple unique instances
+    Uses an index from the IndexProvider to tie it to the CST, and an instance number to make multiple unique instances
     """
 
     index: int
-    number: int
+    instance: int
 
 
 @dataclass(frozen=True)
@@ -30,11 +30,11 @@ class Ghost:
     """
     Not a real node, just a construction device that gets removed later
 
-    Uses an index from the IndexProvider to tie it to the CST, and an extra number to make multiple unique instances
+    Uses an index from the IndexProvider to tie it to the CST, and an instance number to make multiple unique instances
     """
 
     index: int
-    number: int
+    instance: int
 
 
 CfgNode = Node | Ghost
@@ -67,8 +67,8 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 self._cfg[p].add(to)
         return tos
 
-    def _make_cfg_node(self, cst_node: cst.CSTNode, number: int, prev: list[CfgNode]) -> list[CfgNode]:
-        cur = Node(self.get_metadata(IndexProvider, cst_node), number)
+    def _make_cfg_node(self, cst_node: cst.CSTNode, instance: int, prev: list[CfgNode]) -> list[CfgNode]:
+        cur = Node(self.get_metadata(IndexProvider, cst_node), instance)
         return self._edge(prev, cur)
 
     def _clean_up_cfg_ghosts(self, start: CfgNode) -> None:
@@ -103,14 +103,12 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
 
         prev = [start]
 
-        number = 0
+        instance = 0
 
         for param in node.params.params:
-            cur = Node(self.get_metadata(IndexProvider, param), number)
-            self._edge(prev, cur)
-            prev = [cur]
+            prev = self._make_cfg_node(param, instance, prev)  # Param
 
-        prev = self._visit_BaseSuite(node.body, number, prev, fn_end=end, exception_target=end)
+        prev = self._visit_BaseSuite(node.body, instance, prev, fn_end=end, exception_target=end)
 
         self._edge(prev, end)
 
@@ -131,14 +129,17 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                     reachable.add(to)
                     workstack.append(to)
 
+        to_remove = []
         for k in self._cfg:
             if k not in reachable:
-                del self._cfg[k]
+                to_remove.append(k)
+        for k in to_remove:
+            del self._cfg[k]
 
     def _visit_BaseSuite(
         self,
         statements: cst.BaseSuite | cst.SimpleStatementLine,
-        number: int,
+        instance: int,
         prev: list[CfgNode],
         fn_end: CfgNode,
         exception_target: CfgNode,
@@ -148,7 +149,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
         for statement in statements.body:
             prev = self._visit_statement(
                 statement,
-                number,
+                instance,
                 prev,
                 fn_end=fn_end,
                 exception_target=exception_target,
@@ -520,7 +521,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             prev = self._visit_expression(expression.left, number, prev)
             for comparison in expression.comparisons:
                 prev = self._visit_expression(comparison.comparator, number, prev)
-                prev = self._make_cfg_node(comparison, number, prev)
+                prev = self._make_cfg_node(comparison, number, prev)  # ComparisonTarget
         ## Control Flow
         elif m.matches(expression, m.Await()):
             expression: cst.Await = cst.ensure_type(expression, cst.Await)
@@ -618,7 +619,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
         return prev
 
     def _visit_ImportAlias(self, import_alias: cst.ImportAlias, number: int, prev: list[CfgNode]) -> list[CfgNode]:
-        prev = self._make_cfg_node(import_alias.name, number, prev)  # Attribute | Name
+        prev = self._make_cfg_node(import_alias.name, number, prev)  # Attribute, Name
         if import_alias.asname is not None:
             prev = self._make_cfg_node(import_alias.asname, number, prev)  # AsName
         return prev

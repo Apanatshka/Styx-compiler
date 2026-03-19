@@ -54,3 +54,41 @@ def test_multi_def_cfg():
     wrapper.visit(ccfg)
     print(ccfg._cfg)
     assert len(ccfg._start_end) == 5
+
+
+nested_try = """
+def nested_try(a: int) -> int:
+    try:
+        if a < 0:
+            return 0
+        elif a > 10:
+            raise RuntimeError
+        elif a == 10:
+            raise OutOfStock("Not enough stock to update.")
+        a += 1
+    except OutOfStock:
+        if a < 0:
+            return 0
+        elif a > 10:
+            raise RuntimeError
+        a += 1
+    else:
+        if a > 10:
+            raise OutOfStock("Not enough stock to update.")
+        a += 1
+    finally:
+        if a < 10:
+            return 9001
+    return a + 42
+"""
+
+
+def test_nested_try_cfg():
+    source_tree = cst.parse_module(nested_try)
+    wrapper = cst.MetadataWrapper(source_tree)
+    ccfg = ComputeControlFlowGraph()
+    assert len(ccfg._cfg) == 0
+    wrapper.visit(ccfg)
+    print(ccfg._cfg)
+    assert len(ccfg._cfg) > 0
+    print(sum(1 for v in ccfg._cfg.values() if len(v) > 1))

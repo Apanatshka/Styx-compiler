@@ -183,15 +183,14 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
             body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name("state"))], value=dict_node)]
         )
 
-        put_state = cst.parse_statement("ctx.put(state)")
         put_func_state = cst.parse_statement("ctx.put_func_context({})")
 
         return_stmt = cst.parse_statement("return ctx.key")
 
         new_block = new_body.with_changes(
-            body=[*body_transformer.other_statements, put_call, put_state, put_func_state, return_stmt]
+            body=[*body_transformer.other_statements, put_call, put_func_state, return_stmt]
         )
-        reply_to_transformer = ReturnHandlerTransformer()
+        reply_to_transformer = ReturnHandlerTransformer(uses_state=True)
         final_block = new_block.visit(reply_to_transformer)
 
         decorator_name = f"{self.entities[self.current_operator]}_operator"
@@ -234,7 +233,7 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
                 )
 
             # Apply Return Handler to all functions
-            reply_to_transformer = ReturnHandlerTransformer()
+            reply_to_transformer = ReturnHandlerTransformer(uses_state=_uses_state(transformed_func))
             transformed_func = transformed_func.visit(reply_to_transformer)
 
             # Finalize original method signature only for the root function

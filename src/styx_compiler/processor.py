@@ -85,9 +85,8 @@ class FunctionProcessor:
                 return body
             # Loop mode: direct continuation back to loop step (same entity)
             loop_step_name, _op_name, _ = loop_context
-            put_state = cst.parse_statement("ctx.put(state)")
             direct_call = self._create_direct_continuation_call(loop_step_name)
-            return [*body, put_state, direct_call]
+            return [*body, direct_call]
         return body
 
     def _handle_remote_call(self, body: list, i: int, loop_context=None) -> list:

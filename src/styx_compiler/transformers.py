@@ -12,13 +12,9 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
     Also injects 'ctx.put(state)' immediately before the logic.
     """
 
-    def __init__(self):
+    def __init__(self, uses_state: bool):
         super().__init__()
-        self.state_dirty_stack = [False]
-        self.state_aliases = set()  # variables assigned from state[...]
-
-    def _mark_dirty(self):
-        self.state_dirty_stack[-1] = True
+        self.uses_state = uses_state
 
     def _is_graph_terminal(self, node: cst.CSTNode | None) -> bool:
         """
@@ -65,34 +61,6 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
 
         return False
 
-    def leave_Assign(self, _original_node, updated_node):
-        for target in updated_node.targets:
-            # Track state[...] = ... as dirty
-            if m.matches(target.target, m.Subscript(value=m.Name("state"))):
-                self._mark_dirty()
-            # Track state aliases: var = state[...]
-            if isinstance(target.target, cst.Name) and m.matches(
-                updated_node.value, m.Subscript(value=m.Name("state"))
-            ):
-                self.state_aliases.add(target.target.value)
-        return updated_node
-
-    def leave_AugAssign(self, _original_node, updated_node):
-        if m.matches(updated_node.target, m.Subscript(value=m.Name("state"))):
-            self._mark_dirty()
-        return updated_node
-
-    def leave_Expr(self, _original_node, updated_node):
-        """Detect method calls on state aliases (e.g., attr_1.append(...))."""
-        if (
-            isinstance(updated_node.value, cst.Call)
-            and isinstance(updated_node.value.func, cst.Attribute)
-            and isinstance(updated_node.value.func.value, cst.Name)
-            and updated_node.value.func.value.value in self.state_aliases
-        ):
-            self._mark_dirty()
-        return updated_node
-
     def _is_call_remote_async(self, node: cst.CSTNode) -> bool:
         """Check if a statement is a ctx.call_remote_async(...) call."""
         if isinstance(node, cst.SimpleStatementLine):
@@ -113,8 +81,8 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
         return any(param.name.value == "reply_to" for param in node.params.params)
 
     def leave_SimpleStatementLine(self, _original_node, updated_node):
-        # Handle ctx.call_remote_async: prepend ctx.put(state) if dirty
-        if self._is_call_remote_async(updated_node) and self.state_dirty_stack[-1]:
+        # Handle ctx.call_remote_async: prepend ctx.put(state) if uses_state
+        if self._is_call_remote_async(updated_node) and self.uses_state:
             put_state = cst.parse_statement("ctx.put(state)")
             return cst.FlattenSentinel([put_state, updated_node])
 
@@ -143,7 +111,7 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
 
         put_state = cst.parse_statement("ctx.put(state)")
 
-        return cst.FlattenSentinel([put_state, res_stmt]) if self.state_dirty_stack[-1] else res_stmt
+        return cst.FlattenSentinel([put_state, res_stmt]) if self.uses_state else res_stmt
 
     def leave_FunctionDef(self, _original_node, updated_node):
         body_stmts = updated_node.body.body
@@ -153,11 +121,11 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
             new_body = list(updated_node.body.body)
             # Add send_reply for functions with reply_to so the reply chain isn't lost
             if self._has_reply_to_param(updated_node):
-                if self.state_dirty_stack[-1]:
+                if self.uses_state:
                     new_body.append(cst.parse_statement("ctx.put(state)"))
                 new_body.append(cst.parse_statement("return send_reply(ctx, reply_to, None)"))
-            elif self.state_dirty_stack[-1]:
-                # No reply_to but state dirty — just flush state
+            elif self.uses_state:
+                # No reply_to but state used — just flush state
                 new_body.append(cst.parse_statement("ctx.put(state)"))
 
             if new_body != list(updated_node.body.body):

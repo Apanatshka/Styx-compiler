@@ -12,6 +12,7 @@ from libcst import CSTNode, FlattenSentinel, FunctionDef, Module, RemovalSentine
 from libcst_mypy import MypyTypeInferenceProvider
 from libcst_mypy.utils import MypyType
 
+from styx_compiler.comprehension_expander import ComprehensionExpander
 from styx_compiler.config import N_PARTITIONS
 from styx_compiler.processor import FunctionProcessor
 from styx_compiler.transformers import (
@@ -290,9 +291,11 @@ class StyxTranspiler:
         self.entities = visitor.entities
         self.entity_keys = visitor.entity_keys
         self.entity_init_params = visitor.entity_init_params
-        print(f"Discovered Entities: {self.entities}")
-        print(f"Entity Keys: {self.entity_keys}")
-        print(f"Entity Init Params: {self.entity_init_params}")
+        print(f"Identified {len(self.entities)} stateful entities:", list(self.entities.keys()))
+
+        # 1.5. Expand comprehensions into for loops
+        expander = ComprehensionExpander()
+        self.cst_tree = self.cst_tree.visit(expander)
 
         # 2. Linearize
         linearizer = RemoteCallLinearizer(self.entities)
@@ -301,7 +304,7 @@ class StyxTranspiler:
 
         # 3. Run mypy on the linearized code to get type metadata
         module, metadata = StyxTranspiler._resolve_types(linearized_code)
-        print(f"Mypy resolved {len(metadata)} type annotations")
+        print("Type checking passed")
 
         # 4. Transform using the same node tree (metadata lookups match)
         transformer = StyxTransformer(self.entities, metadata, self.entity_keys, self.entity_init_params)

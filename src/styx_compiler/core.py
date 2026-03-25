@@ -117,7 +117,7 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
         helpers = [*list(helpers_module.body), cst.EmptyLine()]
 
         # Filter out stuff for mytype (entity function, logging class) from body
-        stub_names = {"entity", "logging"}
+        stub_names = {"entity", "logging", "send_async"}
         filtered_body = [
             stmt
             for stmt in updated_node.body
@@ -294,7 +294,7 @@ class StyxTranspiler:
         print(f"Identified {len(self.entities)} stateful entities:", list(self.entities.keys()))
 
         # 1.5. Expand comprehensions into for loops
-        expander = ComprehensionExpander()
+        expander = ComprehensionExpander(self.entities)
         self.cst_tree = self.cst_tree.visit(expander)
 
         # 2. Linearize
@@ -323,7 +323,13 @@ class StyxTranspiler:
         The metadata_dict maps cst.CSTNode -> MypyType.
         """
         # Prepend so mypy does not fail
-        stubs = "def entity(cls): return cls\nclass logging:\n    @staticmethod\n    def warning(msg): pass\n"
+        stubs = (
+            "def entity(cls): return cls\n"
+            "class logging:\n"
+            "    @staticmethod\n"
+            "    def warning(msg): pass\n"
+            "def send_async(call): pass\n"
+        )
         full_code = stubs + source_code
 
         # Write to temp file for mypy to analyze
@@ -365,6 +371,7 @@ def main():
     file_name = "user_item.py"
     input_file = "./examples/original/" + file_name
     output_file = "./examples/compiled/" + file_name
+    # output_file = r"C:\Users\alexa\Documents\styx\thesis-user-item\functions.py"
 
     try:
         with open(input_file, encoding="utf-8") as f:

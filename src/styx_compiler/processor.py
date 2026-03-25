@@ -60,6 +60,11 @@ class FunctionProcessor:
                       for loop mode where the tail dispatches back to the loop step.
         """
         for i, stmt in enumerate(body):
+            # Fire-and-forget: send_async(remote_call) — no split, no continuation
+            if self._is_send_async(stmt):
+                body[i] = self._transform_send_async(stmt)
+                continue
+
             # Remote call at top level
             if self._is_remote_call(stmt):
                 return self._handle_remote_call(body, i, loop_context)
@@ -95,7 +100,7 @@ class FunctionProcessor:
         post_split = body[i + 1 :]
         has_continuation = len(post_split) > 0
 
-        target_var, call_node, receiver, remote_method = FunctionProcessor._extract_call_info(stmt)
+        target_var, call_node, receiver, remote_method, tuple_target = FunctionProcessor._extract_call_info(stmt)
 
         if has_continuation:
             self.split_counter += 1
@@ -105,10 +110,28 @@ class FunctionProcessor:
 
             restore_block = self._create_restore_block()
 
-            if target_var != "placeholder_return":
+            # Handle tuple unpacking: inject unpack statement and track individual vars
+            unpack_stmts = []
+            if tuple_target is not None:
+                # Add each element of the tuple to defined_vars
+                for el in tuple_target.elements:
+                    if isinstance(el.value, cst.Name):
+                        self.defined_vars.add(el.value.value)
+                # Create unpacking statement: (a, b) = __tuple_result
+                unpack_stmts.append(
+                    cst.SimpleStatementLine(
+                        body=[
+                            cst.Assign(
+                                targets=[cst.AssignTarget(target=tuple_target)],
+                                value=cst.Name(target_var),
+                            )
+                        ]
+                    )
+                )
+            elif target_var != "placeholder_return":
                 self.defined_vars.add(target_var)
 
-            cont_body = restore_block + self._split_body(post_split, loop_context)
+            cont_body = restore_block + unpack_stmts + self._split_body(post_split, loop_context)
 
             cont_func = self._create_continuation(next_func_name, cont_body, target_var)
             self.generated_functions.append(cont_func)
@@ -369,8 +392,15 @@ class FunctionProcessor:
     @staticmethod
     def _extract_call_info(stmt):
         element = stmt.body[0]
+        tuple_target = None
         if isinstance(element, cst.Assign):
-            target_var = element.targets[0].target.value
+            target = element.targets[0].target
+            if isinstance(target, cst.Tuple):
+                # Tuple unpacking: price, stock = self.ret_tuple(item)
+                target_var = "__tuple_result"
+                tuple_target = target
+            else:
+                target_var = target.value
             call_node = element.value
         elif isinstance(element, cst.Expr):
             target_var = "placeholder_return"
@@ -389,7 +419,7 @@ class FunctionProcessor:
             msg = f"Unsupported call type: {type(call_node.func)}"
             raise ValueError(msg)
 
-        return target_var, call_node, receiver, remote_method
+        return target_var, call_node, receiver, remote_method, tuple_target
 
     def _track_vars(self, stmt):
         """Track variable existence only (for context saving)."""
@@ -425,6 +455,58 @@ class FunctionProcessor:
         if isinstance(last, cst.SimpleStatementLine):
             return any(isinstance(el, cst.Raise) for el in last.body)
         return False
+
+    def _is_send_async(self, stmt):
+        """Check if a statement is send_async(remote_call)."""
+        if not isinstance(stmt, cst.SimpleStatementLine) or not stmt.body:
+            return False
+        element = stmt.body[0]
+        if not isinstance(element, cst.Expr) or not isinstance(element.value, cst.Call):
+            return False
+        func = element.value.func
+        return isinstance(func, cst.Name) and func.value == "send_async"
+
+    def _transform_send_async(self, stmt):
+        """Transform send_async(remote_call) into ctx.call_remote_async without continuation."""
+        call = stmt.body[0].value  # The send_async(...) Call
+        inner_call = call.args[0].value  # The inner remote call
+
+        # Extract info from inner call
+        if isinstance(inner_call.func, cst.Attribute):
+            receiver = inner_call.func.value
+            method = inner_call.func.attr.value
+        elif isinstance(inner_call.func, cst.Name):
+            receiver = inner_call.func
+            method = "create"
+        else:
+            msg = f"Unsupported call type inside send_async: {type(inner_call.func)}"
+            raise ValueError(msg)
+
+        key_value = self._resolve_key_for_call(receiver, inner_call, method)
+        op_name = self._resolve_operator_name(receiver)
+
+        # Build params WITHOUT reply_to
+        if not inner_call.args:
+            params_value = cst.Tuple(elements=[])
+        else:
+            original_args = [arg.value for arg in inner_call.args]
+            params_value = cst.Tuple(elements=[cst.Element(value=v) for v in original_args])
+
+        return cst.SimpleStatementLine(
+            body=[
+                cst.Expr(
+                    value=cst.Call(
+                        func=cst.parse_expression("ctx.call_remote_async"),
+                        args=[
+                            cst.Arg(keyword=cst.Name("operator_name"), value=cst.SimpleString(f"'{op_name}'")),
+                            cst.Arg(keyword=cst.Name("function_name"), value=cst.SimpleString(f"'{method}'")),
+                            cst.Arg(keyword=cst.Name("key"), value=key_value),
+                            cst.Arg(keyword=cst.Name("params"), value=params_value),
+                        ],
+                    )
+                )
+            ]
+        )
 
     def _is_remote_call(self, stmt):
         if not isinstance(stmt, cst.SimpleStatementLine) or not stmt.body:

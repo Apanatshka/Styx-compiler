@@ -142,9 +142,21 @@ class RemoteCallLinearizer(cst.CSTTransformer):
     def __init__(self, entities: dict[str, str] | None = None):
         self.entities = entities or {}
         self.call_counter = 0
+        self.current_class: str | None = None
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> bool:
+        self.current_class = node.name.value
+        return True
+
+    def leave_ClassDef(self, _original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.ClassDef:
+        self.current_class = None
+        return updated_node
 
     def leave_FunctionDef(self, _original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
         """Process each function and linearize remote calls."""
+        if self.current_class is not None and self.current_class not in self.entities:
+            return updated_node
+
         self.call_counter = 0
 
         linearizer = StatementLinearizer(self.entities)
@@ -273,8 +285,24 @@ class CallExtractorAndReplacer(cst.CSTTransformer):
         self.entities = entities or {}
         self.extracted_calls: list[tuple[str, cst.BaseExpression]] = []
         self.counter = start_counter
+        self._in_send_async = False
+
+    def visit_Call(self, node: cst.Call) -> bool:
+        """Set flag when entering send_async() to prevent extraction of inner calls."""
+        if isinstance(node.func, cst.Name) and node.func.value == "send_async":
+            self._in_send_async = True
+        return True
 
     def leave_Call(self, _original_node: cst.Call, updated_node: cst.Call) -> cst.BaseExpression:
+        # Don't extract send_async itself — clear flag and return unchanged
+        if isinstance(updated_node.func, cst.Name) and updated_node.func.value == "send_async":
+            self._in_send_async = False
+            return updated_node
+
+        # Don't extract calls inside send_async
+        if self._in_send_async:
+            return updated_node
+
         is_entity_instantiation = False
         if isinstance(updated_node.func, cst.Name) and updated_node.func.value in self.entities:
             is_entity_instantiation = True

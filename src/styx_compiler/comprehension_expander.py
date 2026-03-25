@@ -28,6 +28,12 @@ class OutermostCompFinder(cst.CSTVisitor):
     def visit_GeneratorExp(self, node: cst.GeneratorExp) -> bool:
         return self._check_and_stop(node)
 
+    def visit_FunctionDef(self, _node: cst.FunctionDef) -> bool:
+        return False
+
+    def visit_ClassDef(self, _node: cst.ClassDef) -> bool:
+        return False
+
 
 class TargetedReplacer(cst.CSTTransformer):
     """Replaces only the specifically targeted comprehension node and builds its loop."""
@@ -50,6 +56,12 @@ class TargetedReplacer(cst.CSTTransformer):
 
     def visit_GeneratorExp(self, node: cst.GeneratorExp) -> bool:
         return node is not self.target
+
+    def visit_FunctionDef(self, _node: cst.FunctionDef) -> bool:
+        return False
+
+    def visit_ClassDef(self, _node: cst.ClassDef) -> bool:
+        return False
 
     def leave_ListComp(self, original_node: cst.ListComp, updated_node: cst.ListComp) -> cst.BaseExpression:
         if original_node is self.target:
@@ -77,12 +89,22 @@ class TargetedReplacer(cst.CSTTransformer):
 
 
 class ComprehensionExpander(cst.CSTTransformer):
-    def __init__(self) -> None:
+    def __init__(self, entities: dict[str, str] | None = None) -> None:
         super().__init__()
+        self.entities = entities or {}
+        self.current_class: str | None = None
         self._counter = 0
 
         # Stack to handle nested functions (visit happens twice before leave)
         self._counter_stack: list[int] = []
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> bool:
+        self.current_class = node.name.value
+        return True
+
+    def leave_ClassDef(self, _original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.ClassDef:
+        self.current_class = None
+        return updated_node
 
     def visit_FunctionDef(self, _node: cst.FunctionDef) -> bool:
         self._counter_stack.append(self._counter)
@@ -106,6 +128,10 @@ class ComprehensionExpander(cst.CSTTransformer):
         return self._process_block(updated_node)
 
     def _process_block(self, node: cst.IndentedBlock | cst.Module) -> cst.IndentedBlock | cst.Module:
+        # Only expand if we are NOT in a class OR if we are in an entity class
+        if self.current_class is not None and self.current_class not in self.entities:
+            return node
+
         modified = True
         current_body = list(node.body)
 

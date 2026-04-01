@@ -188,15 +188,16 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
             prev = self._visit_expression(statement.value, instance, prev)
             # then the multiple LHS, from left to right
             for target in statement.targets:
+                prev = self._visit_expression(target.target, instance, prev)
                 prev = self._make_cfg_node(target, instance, prev)  # AssignTarget
         elif m.matches(statement, m.AugAssign()):
             statement: cst.AugAssign = cst.ensure_type(statement, cst.AugAssign)
-            # note we're making the AugAssign a node first to represent reading the value from the target
-            prev = self._make_cfg_node(statement, instance, prev)  # AugAssign
+            # note we're visiting LHS first to represent reading the value from the target
+            prev = self._visit_expression(statement.target, instance, prev)
             # then we visit the RHS expression to find more reads
             prev = self._visit_expression(statement.value, instance, prev)
-            # finally we write to the LHS
-            prev = self._visit_expression(statement.target, instance, prev)
+            # finally we write to the LHS, represented by a node of the whole assignment
+            prev = self._make_cfg_node(statement, instance, prev)  # AugAssign
         elif m.matches(statement, m.Break()):
             if loop_break_target is None:
                 msg = "Found break outside of loop"
@@ -360,6 +361,7 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
                 handler_exits.append(handler_exit)
 
                 if handler.name is not None:
+                    handler_prev = self._visit_expression(handler.name.name, instance, handler_prev)
                     handler_prev = self._make_cfg_node(handler.name, instance, handler_prev)  # AsName
                 handler_prev = self._visit_BaseSuite(
                     handler.body,
@@ -681,16 +683,12 @@ class CfgNodeTester(cst.CSTVisitor):
     def visit_Param(self, node: cst.Param) -> bool | None:
         if self.active:
             assert self._has_node(node)
-            # TODO: should we visit deeper into Param too?
             return False
         return None
 
     def visit_AssignTarget(self, node: cst.AssignTarget) -> bool | None:
         if self.active:
             assert self._has_node(node)
-            # TODO: should we visit deeper into AssignTarget too?
-            return False
-        return None
 
     def visit_AugAssign(self, node: cst.AugAssign) -> bool | None:
         if self.active:
@@ -703,9 +701,6 @@ class CfgNodeTester(cst.CSTVisitor):
     def visit_Attribute(self, node: cst.Attribute) -> bool | None:
         if self.active:
             assert self._has_node(node)
-            # TODO: should we visit deeper into Attribute too?
-            return False
-        return None
 
     def visit_Name(self, node: cst.Name) -> bool | None:
         if self.active:
@@ -847,4 +842,10 @@ class CfgNodeTester(cst.CSTVisitor):
         self.active = False
 
     def leave_AnnAssign_annotation(self, _node: cst.FunctionDef) -> None:
+        self.active = True
+
+    def visit_Attribute_attr(self, _node: cst.FunctionDef) -> None:
+        self.active = False
+
+    def leave_Attribute_attr(self, _node: cst.FunctionDef) -> None:
         self.active = True

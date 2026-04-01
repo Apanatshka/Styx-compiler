@@ -1,3 +1,8 @@
+"""
+Data-flow analysis engine as described in "FlowSpec: A declarative specification language for intra-procedural
+flow-sensitive data-flow analysis" by Smits, Wachsmuth and Visser (https://doi.org/10.1016/j.cola.2019.100924).
+"""
+
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,7 +15,7 @@ type Cfg = dict[Node, set[Node]]
 def compute_sccs(cfg: Cfg, extremals: list[Node]) -> list[list[Node]]:
     """
     Tarjan's Strongly Connected Component algorithm, with a slight modification to force the order of nodes within an
-     SCC into a postorder traversal. See https://doi.org/10.1016/j.cola.2019.100924, Section 5.3.1 / Figure 26.
+     SCC into a postorder traversal. See section 5.3.1 / figure 26.
 
     You can reverse the control-flow graphs and give the list of end nodes and this will work just as well.
 
@@ -77,8 +82,10 @@ type TB[T] = T | SymbolicTop | SymbolicBottom
 
 
 class Lattice[T](ABC):
-    top = SymbolicTop()
-    bottom = SymbolicBottom()
+    def __init__(self):
+        super().__init__()
+        self.top = SymbolicTop()
+        self.bottom = SymbolicBottom()
 
     def nleq(self, left: TB[T], right: TB[T]) -> bool:
         if isinstance(left, SymbolicBottom) or isinstance(right, SymbolicTop):
@@ -109,7 +116,7 @@ class Lattice[T](ABC):
 class DataflowProperty[T]:
     forward: bool
     initial: T
-    transfer_func: Callable[[Node, TB[T]], TB[T]]
+    transfer_func: dict[Node, Callable[[T], T]]
     lattice: Lattice[T]
 
 
@@ -118,6 +125,11 @@ def compute_dataflow_property[T](
     start_end: list[tuple[Node, Node]],
     df_property: DataflowProperty[T],
 ) -> dict[Node, tuple[TB[T], TB[T]]]:
+    """
+    Compute a single dataflow property. We're not doing dependent dataflow properties like the paper. See section 5.3.2
+     and figure 27.
+    TODO: filter the CFG to efficiently handle all the identity function transfer functions.
+    """
     prop = {}
     for node, nexts in cfg:
         prop[node] = df_property.lattice.bottom
@@ -145,10 +157,35 @@ def compute_dataflow_property[T](
             done = True
             for node in scc:
                 for next_node in cfg[node]:
-                    step = df_property.transfer_func(node, prop[node])
+                    assert not isinstance(prop[node], SymbolicTop | SymbolicBottom)
+                    step = df_property.transfer_func[node](prop[node])
                     if df_property.lattice.nleq(step, prop[next_node]):
                         prop[next_node] = df_property.lattice.join(step, prop[next_node])
                         if next_node in scc:
                             done = False
 
-    return {node: (p, df_property.transfer_func(node, p)) for node, p in prop}
+    return {node: (p, df_property.transfer_func[node](p)) for node, p in prop}
+
+
+class MaySet[T](Lattice[frozenset[T]]):
+    def __init__(self):
+        super().__init__()
+        self.bottom = frozenset()
+
+    def _nleq_helper(self, left: frozenset[T], right: frozenset[T]) -> bool:
+        return not (left <= right)
+
+    def _join_helper(self, left: frozenset[T], right: frozenset[T]) -> frozenset[T]:
+        return left | right
+
+
+class MustSet[T](Lattice[frozenset[T]]):
+    def __init__(self):
+        super().__init__()
+        self.top = frozenset()
+
+    def _nleq_helper(self, left: frozenset[T], right: frozenset[T]) -> bool:
+        return not (left >= right)
+
+    def _join_helper(self, left: frozenset[T], right: frozenset[T]) -> frozenset[T]:
+        return left & right

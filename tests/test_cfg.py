@@ -1,4 +1,4 @@
-"""Tests for the styx_compiler.main."""
+"""Tests for styx_compiler.control_flow."""
 
 import libcst as cst
 

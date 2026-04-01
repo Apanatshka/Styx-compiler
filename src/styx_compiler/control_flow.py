@@ -54,17 +54,12 @@ class ComputeControlFlowGraph(cst.CSTVisitor):
 
     def _edge(self, prev: list[CfgNode], cur: CfgNode) -> list[CfgNode]:
         for p in prev:
-            if p not in self._cfg:
-                self._cfg[p] = set()
-            self._cfg[p].add(cur)
+            self._cfg.setdefault(p, set()).add(cur)
         return [cur]
 
     def _edges(self, prev: list[CfgNode], tos: list[CfgNode]) -> list[CfgNode]:
         for p in prev:
-            if p not in self._cfg:
-                self._cfg[p] = set()
-            for to in tos:
-                self._cfg[p].add(to)
+            self._cfg.setdefault(p, set()).update(tos)
         return tos
 
     def _make_cfg_node(self, cst_node: cst.CSTNode, instance: int, prev: list[CfgNode]) -> list[CfgNode]:

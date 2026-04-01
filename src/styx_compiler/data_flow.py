@@ -43,7 +43,7 @@ def compute_sccs(cfg: Cfg, extremals: list[Node]) -> list[list[Node]]:
         # N.B. we don't add node to scc_stack here, only to the node_on_stack set. The set is used next and in the recursive
         #  calls, so it doesn't affect the algorithm's correctness to postpone adding to scc_stack.
 
-        for next_node in cfg[node]:
+        for next_node in cfg.get(node, set()):
             if next_node not in node_index:
                 strong_connect(next_node)
                 node_lowlink[node] = min(node_lowlink[node], node_lowlink[next_node])
@@ -131,7 +131,7 @@ def compute_dataflow_property[T](
     TODO: filter the CFG to efficiently handle all the identity function transfer functions.
     """
     prop = {}
-    for node, nexts in cfg:
+    for node, nexts in cfg.items():
         prop[node] = df_property.lattice.bottom
         for next_node in nexts:
             prop[next_node] = df_property.lattice.bottom
@@ -140,9 +140,9 @@ def compute_dataflow_property[T](
         extremals = [start for start, _ in start_end]
     else:
         rev_cfg = {}
-        for node, nexts in cfg:
+        for node, nexts in cfg.items():
             for next_node in nexts:
-                rev_cfg[next_node] = cfg[node]
+                rev_cfg.setdefault(next_node, set()).add(node)
         cfg = rev_cfg
         extremals = [end for _, end in start_end]
 
@@ -156,7 +156,7 @@ def compute_dataflow_property[T](
         while not done:
             done = True
             for node in scc:
-                for next_node in cfg[node]:
+                for next_node in cfg.get(node, set()):
                     assert not isinstance(prop[node], SymbolicTop | SymbolicBottom)
                     step = df_property.transfer_func[node](prop[node])
                     if df_property.lattice.nleq(step, prop[next_node]):
@@ -164,7 +164,9 @@ def compute_dataflow_property[T](
                         if next_node in scc:
                             done = False
 
-    return {node: (p, df_property.transfer_func[node](p)) for node, p in prop}
+    if df_property.forward:
+        return {node: (p, df_property.transfer_func[node](p)) for node, p in prop.items()}
+    return {node: (df_property.transfer_func[node](p), p) for node, p in prop.items()}
 
 
 class MaySet[T](Lattice[frozenset[T]]):

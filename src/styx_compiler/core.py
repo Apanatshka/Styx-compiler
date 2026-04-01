@@ -21,6 +21,7 @@ from styx_compiler.transformers import (
     RemoteCallLinearizer,
     ReturnHandlerTransformer,
     StateAccessTransformer,
+    normalize_function_body,
 )
 from styx_compiler.visitor import EntityDiscoveryVisitor
 
@@ -155,6 +156,10 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
     ) -> FunctionDef | RemovalSentinel | FlattenSentinel:
         if self.current_operator is None:
             return updated_node
+
+        # Normalize inline function bodies (SimpleStatementSuite -> IndentedBlock)
+        original_node = normalize_function_body(original_node)
+        updated_node = normalize_function_body(updated_node)
 
         func_name = original_node.name.value
 
@@ -324,11 +329,12 @@ class StyxTranspiler:
         """
         # Prepend so mypy does not fail
         stubs = (
+            "from typing import Any\n"
             "def entity(cls): return cls\n"
             "class logging:\n"
             "    @staticmethod\n"
             "    def warning(msg): pass\n"
-            "def send_async(call): pass\n"
+            "def send_async(call: Any) -> None: pass\n"
         )
         full_code = stubs + source_code
 
@@ -339,7 +345,14 @@ class StyxTranspiler:
 
         try:
             # Make sure the code is type correct
-            stdout, _stderr, exit_code = mypy.api.run([str(tmp_path)])
+            # Disable func-returns-value: send_async(obj.void_method()) is a DSL
+            # pattern that intentionally wraps void calls for fire-and-forget dispatch.
+            stdout, _stderr, exit_code = mypy.api.run(
+                [
+                    "--disable-error-code=func-returns-value",
+                    str(tmp_path),
+                ]
+            )
             if exit_code != 0:
                 clean_errs = stdout.replace(str(tmp_path), "source")
                 msg = f"Mypy Type Check Failed:\n{clean_errs}"
@@ -371,7 +384,6 @@ def main():
     file_name = "user_item.py"
     input_file = "./examples/original/" + file_name
     output_file = "./examples/compiled/" + file_name
-    # output_file = r"C:\Users\alexa\Documents\styx\thesis-user-item\functions.py"
 
     try:
         with open(input_file, encoding="utf-8") as f:

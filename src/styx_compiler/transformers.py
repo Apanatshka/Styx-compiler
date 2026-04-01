@@ -6,6 +6,18 @@ import libcst as cst
 import libcst.matchers as m
 
 
+def normalize_function_body(node: cst.FunctionDef) -> cst.FunctionDef:
+    """Convert inline function bodies (SimpleStatementSuite) to IndentedBlock.
+
+    Inline definitions like `def f(): return x` parse as SimpleStatementSuite.
+    The rest of the compiler assumes IndentedBlock, so we normalize here.
+    """
+    if isinstance(node.body, cst.SimpleStatementSuite):
+        new_body = cst.IndentedBlock(body=[cst.SimpleStatementLine(body=list(node.body.body))])
+        return node.with_changes(body=new_body)
+    return node
+
+
 class ReturnHandlerTransformer(cst.CSTTransformer):
     """
     Finds 'return' statements and wraps them with the reply_to stack logic.
@@ -97,6 +109,11 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
 
         ret_val = return_node.value if return_node.value else cst.Name("None")
 
+        # Ensure implicit tuples (return a, b) get parenthesized so they
+        # become a single argument: send_reply(ctx, reply_to, (a, b))
+        if isinstance(ret_val, cst.Tuple) and not ret_val.lpar:
+            ret_val = ret_val.with_changes(lpar=[cst.LeftParen()], rpar=[cst.RightParen()])
+
         # Generate: return send_reply(ctx, reply_to, result)
         send_reply_call = cst.Call(
             func=cst.Name("send_reply"),
@@ -156,6 +173,9 @@ class RemoteCallLinearizer(cst.CSTTransformer):
         """Process each function and linearize remote calls."""
         if self.current_class is not None and self.current_class not in self.entities:
             return updated_node
+
+        # Normalize inline function bodies (SimpleStatementSuite -> IndentedBlock)
+        updated_node = normalize_function_body(updated_node)
 
         self.call_counter = 0
 

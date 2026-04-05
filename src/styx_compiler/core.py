@@ -17,7 +17,6 @@ from styx_compiler.config import N_PARTITIONS
 from styx_compiler.processor import FunctionProcessor
 from styx_compiler.transformers import (
     EntityTypeReplacer,
-    InitBodyTransformer,
     RemoteCallLinearizer,
     ReturnHandlerTransformer,
     StateAccessTransformer,
@@ -169,8 +168,8 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
             return cst.RemoveFromParent()
         return self.transform_method(original_node, updated_node)
 
-    def transform_init(self, node: cst.FunctionDef) -> cst.FunctionDef:
-        new_name = cst.Name(value="create")
+    def transform_init(self, node: cst.FunctionDef) -> cst.FlattenSentinel:
+        new_name = cst.Name(value="insert")
 
         ctx_param = cst.Param(name=cst.Name("ctx"), annotation=cst.Annotation(annotation=cst.Name("StatefulFunction")))
         reply_to_param = cst.Param(
@@ -180,35 +179,53 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
         )
         new_params = [ctx_param] + [p for p in node.params.params if p.name.value != "self"] + [reply_to_param]
 
-        body_transformer = InitBodyTransformer()
-        new_body = node.body.visit(body_transformer)
-
-        dict_node = cst.Dict(elements=body_transformer.state_dict_entries)
-
-        put_call = cst.SimpleStatementLine(
-            body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name("state"))], value=dict_node)]
-        )
-
+        init_state = cst.parse_statement("state = {}")
         put_func_state = cst.parse_statement("ctx.put_func_context({})")
-
         return_stmt = cst.parse_statement("return ctx.key")
 
-        new_block = new_body.with_changes(
-            body=[*body_transformer.other_statements, put_call, put_func_state, return_stmt]
-        )
-        reply_to_transformer = ReturnHandlerTransformer(uses_state=True)
-        final_block = new_block.visit(reply_to_transformer)
+        new_block = node.body.with_changes(body=[init_state, *list(node.body.body), put_func_state, return_stmt])
 
+        base_insert_func = node.with_changes(
+            name=new_name,
+            params=node.params.with_changes(params=new_params),
+            body=new_block,
+            asynchronous=cst.Asynchronous(),
+        )
+
+        processor = FunctionProcessor(
+            base_insert_func,
+            self.current_operator,
+            self.entities,
+            self.metadata,
+            self.entity_keys,
+            self.entity_init_params,
+        )
+        new_functions = processor.process()
+
+        final_nodes = []
         decorator_name = f"{self.entities[self.current_operator]}_operator"
         decorator = cst.Decorator(decorator=cst.Attribute(value=cst.Name(decorator_name), attr=cst.Name("register")))
 
-        return node.with_changes(
-            name=new_name,
-            params=node.params.with_changes(params=new_params),
-            body=final_block,
-            asynchronous=cst.Asynchronous(),
-            decorators=[decorator],
-        )
+        for func in new_functions:
+            state_transformer = StateAccessTransformer()
+            transformed_func = func.visit(state_transformer)
+
+            # Prepend `state = ctx.get()` ONLY for continuations of insert
+            if _uses_state(transformed_func) and transformed_func.name.value != "insert":
+                get_state = cst.parse_statement("state = ctx.get()")
+                transformed_func = transformed_func.with_changes(
+                    body=cst.IndentedBlock(body=[get_state, *list(transformed_func.body.body)])
+                )
+
+            reply_to_transformer = ReturnHandlerTransformer(uses_state=_uses_state(transformed_func))
+            transformed_func = transformed_func.visit(reply_to_transformer)
+
+            transformed_func = transformed_func.with_changes(decorators=[decorator])
+
+            final_nodes.append(transformed_func)
+            final_nodes.append(cst.EmptyLine())
+
+        return cst.FlattenSentinel(final_nodes)
 
     def transform_method(
         self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
@@ -399,3 +416,7 @@ def main():
         f.write(output_code)
 
     print(f"Successfully transpiled '{input_file}' to '{output_file}'")
+
+
+if __name__ == "__main__":
+    main()

@@ -73,13 +73,25 @@ class FunctionProcessor:
             if isinstance(stmt, cst.If) and self._if_contains_remote_call(stmt):
                 return self._handle_if(body, i, loop_context)
 
+            # If-statement without remote calls but with send_async inside — transform in-place
+            if isinstance(stmt, cst.If):
+                body[i] = self._transform_send_async_in_if(stmt)
+
             # For-loop with remote calls in body
             if isinstance(stmt, cst.For) and self._for_contains_remote_call(stmt):
                 return self._handle_loop(body, i, loop_context)
 
+            # For-loop without remote calls — transform any nested send_async in-place
+            if isinstance(stmt, cst.For):
+                body[i] = self._transform_send_async_in_compound(stmt)
+
             # While-loop with remote calls in body
             if isinstance(stmt, cst.While) and self._while_contains_remote_call(stmt):
                 return self._handle_loop(body, i, loop_context)
+
+            # While-loop without remote calls — transform any nested send_async in-place
+            if isinstance(stmt, cst.While):
+                body[i] = self._transform_send_async_in_compound(stmt)
 
             self._track_vars(stmt)
 
@@ -184,13 +196,18 @@ class FunctionProcessor:
             # No else but if-branch dispatches — put post-if in else to prevent fallthrough
             processed_post_if = self._split_body(post_if, loop_context)
             new_else = cst.Else(body=cst.IndentedBlock(body=processed_post_if))
+        elif if_branch_dispatches and not post_if and loop_context:
+            # No else, no post-if, but inside a loop — the false path must loop back
+            loop_step_name, _, _ = loop_context
+            loop_back = self._create_direct_continuation_call(loop_step_name)
+            new_else = cst.Else(body=cst.IndentedBlock(body=[loop_back]))
 
         # Restore to pre-branch state (caller determines what's defined after)
         self.defined_vars = saved_vars
 
         new_if = if_stmt.with_changes(body=cst.IndentedBlock(body=new_if_body), orelse=new_else)
 
-        if if_stmt.orelse is not None or (if_branch_dispatches and post_if):
+        if if_stmt.orelse is not None or (if_branch_dispatches and (post_if or loop_context)):
             return [new_if]
         return [new_if, *post_if]
 
@@ -428,7 +445,9 @@ class FunctionProcessor:
                 if isinstance(element, cst.Assign):
                     for target in element.targets:
                         if isinstance(target.target, cst.Name):
-                            self.defined_vars.add(target.target.value)
+                            var_name = target.target.value
+                            if var_name != "state":
+                                self.defined_vars.add(var_name)
         elif isinstance(stmt, cst.If):
             for s in stmt.body.body:
                 self._track_vars(s)
@@ -455,6 +474,40 @@ class FunctionProcessor:
         if isinstance(last, cst.SimpleStatementLine):
             return any(isinstance(el, cst.Raise) for el in last.body)
         return False
+
+    def _transform_send_async_in_if(self, node: cst.If) -> cst.If:
+        """Recursively transform send_async calls inside if/elif/else blocks."""
+        new_body = self._transform_send_async_in_block(list(node.body.body))
+        new_if = node.with_changes(body=cst.IndentedBlock(body=new_body))
+        if node.orelse is not None:
+            if isinstance(node.orelse, cst.Else):
+                new_else_body = self._transform_send_async_in_block(list(node.orelse.body.body))
+                new_else = node.orelse.with_changes(body=cst.IndentedBlock(body=new_else_body))
+                new_if = new_if.with_changes(orelse=new_else)
+            elif isinstance(node.orelse, cst.If):
+                new_if = new_if.with_changes(orelse=self._transform_send_async_in_if(node.orelse))
+        return new_if
+
+    def _transform_send_async_in_block(self, body: list) -> list:
+        """Transform send_async calls in a block, recursing into all compound statements."""
+        for i, stmt in enumerate(body):
+            if self._is_send_async(stmt):
+                body[i] = self._transform_send_async(stmt)
+            elif isinstance(stmt, cst.If):
+                body[i] = self._transform_send_async_in_if(stmt)
+            elif isinstance(stmt, (cst.For, cst.While)):
+                body[i] = self._transform_send_async_in_compound(stmt)
+        return body
+
+    def _transform_send_async_in_compound(self, node):
+        """Transform send_async calls inside a for/while loop body (and else clause)."""
+        new_body = self._transform_send_async_in_block(list(node.body.body))
+        new_node = node.with_changes(body=cst.IndentedBlock(body=new_body))
+        if node.orelse is not None and isinstance(node.orelse, cst.Else):
+            new_else_body = self._transform_send_async_in_block(list(node.orelse.body.body))
+            new_else = node.orelse.with_changes(body=cst.IndentedBlock(body=new_else_body))
+            new_node = new_node.with_changes(orelse=new_else)
+        return new_node
 
     def _is_send_async(self, stmt):
         """Check if a statement is send_async(remote_call)."""
@@ -521,6 +574,15 @@ class FunctionProcessor:
         if not isinstance(val, cst.Call):
             return False
 
+        # Ignore self.__key__()
+        if (
+            isinstance(val.func, cst.Attribute)
+            and isinstance(val.func.value, cst.Name)
+            and val.func.value.value == "self"
+            and val.func.attr.value == "__key__"
+        ):
+            return False
+
         # Case 1: entity initialization, item = Item(name, price)
         if isinstance(val.func, cst.Name):
             return val.func.value in self.entities
@@ -549,6 +611,14 @@ class FunctionProcessor:
 
         if isinstance(node, cst.Call) and isinstance(node.func, cst.Name) and node.func.value in self.entities:
             return node.func.value
+
+        # Fallback for newly generated AST nodes (e.g. from transform_init) where metadata is None
+        if isinstance(node, cst.Name):
+            for param in getattr(self.original_func.params, "params", []):
+                if param.name.value == node.value and param.annotation:
+                    ann = param.annotation.annotation
+                    if isinstance(ann, cst.Name) and ann.value in self.entities:
+                        return ann.value
 
         return None
 

@@ -218,6 +218,7 @@ class StatementLinearizer(cst.CSTTransformer):
                 elif (
                     isinstance(new_stmt, cst.Assign)
                     and len(new_stmt.targets) == 1
+                    and isinstance(new_stmt.targets[0].target, cst.Name)
                     and isinstance(new_stmt.value, cst.Name)
                     and new_stmt.value.value == last_extracted_var
                 ):
@@ -323,6 +324,15 @@ class CallExtractorAndReplacer(cst.CSTTransformer):
         if self._in_send_async:
             return updated_node
 
+        # Don't extract self.__key__()
+        if (
+            isinstance(updated_node.func, cst.Attribute)
+            and isinstance(updated_node.func.value, cst.Name)
+            and updated_node.func.value.value == "self"
+            and updated_node.func.attr.value == "__key__"
+        ):
+            return updated_node
+
         is_entity_instantiation = False
         if isinstance(updated_node.func, cst.Name) and updated_node.func.value in self.entities:
             is_entity_instantiation = True
@@ -402,7 +412,22 @@ class StateAccessTransformer(cst.CSTTransformer):
     Transforms:
     1. self.attribute -> state['attribute']
     2. self           -> ctx.key
+    3. self.__key__() -> ctx.key
     """
+
+    def leave_Call(self, original_node, updated_node):
+        # Handles self.__key__() -> ctx.key
+        if m.matches(original_node, m.Call(func=m.Attribute(value=m.Name("self"), attr=m.Name("__key__")))):
+            return cst.Attribute(value=cst.Name("ctx"), attr=cst.Name("key"))
+        return updated_node
+
+    def leave_AnnAssign(self, _original_node, updated_node):
+        # If the target is transformed to a Subscript (like state['var']),
+        # we must convert the AnnAssign to a regular Assign
+        if isinstance(updated_node.target, cst.Subscript):
+            value = updated_node.value if updated_node.value is not None else cst.Name("None")
+            return cst.Assign(targets=[cst.AssignTarget(target=updated_node.target)], value=value)
+        return updated_node
 
     def leave_Attribute(self, original_node, updated_node):
         # Handles self.attribute -> state['attribute']

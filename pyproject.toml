@@ -16,13 +16,13 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "hatch>=1.13.0,<2",
-  "prek>=0.3.6,<2",
-  "pytest>=9.0.2,<10",
-  "pytest-cov>=7.0.0,<8",
-  "mkdocstrings[python]>=1.0.3,<2",
-  "mkdocs-material>=9.7.5,<10",
-  "setuptools-scm>=9.2.2,<10",
+  "hatch>=1.13.0",
+  "prek>=0.3.6",
+  "pytest>=9.0.2",
+  "pytest-cov>=7.0.0",
+  "mkdocstrings[python]>=1.0.3",
+  "mkdocs-material>=9.7.5",
+  "setuptools-scm>=9.2.2",
 ]
 
 [build-system]

@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.14"
 
 [options]
-exclude-newer = "2026-03-25T09:17:12.685524Z"
+exclude-newer = "2026-03-31T14:19:26.944856Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -1068,13 +1068,13 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "hatch", specifier = ">=1.13.0,<2" },
-    { name = "mkdocs-material", specifier = ">=9.7.5,<10" },
-    { name = "mkdocstrings", extras = ["python"], specifier = ">=1.0.3,<2" },
-    { name = "prek", specifier = ">=0.3.6,<2" },
-    { name = "pytest", specifier = ">=9.0.2,<10" },
-    { name = "pytest-cov", specifier = ">=7.0.0,<8" },
-    { name = "setuptools-scm", specifier = ">=9.2.2,<10" },
+    { name = "hatch", specifier = ">=1.13.0" },
+    { name = "mkdocs-material", specifier = ">=9.7.5" },
+    { name = "mkdocstrings", extras = ["python"], specifier = ">=1.0.3" },
+    { name = "prek", specifier = ">=0.3.6" },
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytest-cov", specifier = ">=7.0.0" },
+    { name = "setuptools-scm", specifier = ">=9.2.2" },
 ]
 
 [[package]]

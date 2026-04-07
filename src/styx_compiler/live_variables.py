@@ -45,6 +45,7 @@ class CollectLiveVariablesTransferFunctions(cst.CSTVisitor):
                 if qual_name.source == QualifiedNameSource.LOCAL:
                     return [target.value]
         if m.matches(target, m.List() | m.Tuple()):
+            # noinspection PyUnresolvedReferences
             return [name for el in target.elements for name in self._get_lhs_names(el)]
         return []
 
@@ -54,28 +55,32 @@ class CollectLiveVariablesTransferFunctions(cst.CSTVisitor):
     def visit_Param(self, node: cst.Param) -> bool | None:
         if self._active:
             index = self._provider.get_metadata(IndexProvider, node)
-            self._tfs[Node(index, 0)] = lambda lives: lives.difference([node.name.value])
+            name = node.name.value
+            self._tfs[Node(index, 0)] = lambda lives, name=name: lives.difference([name])
             return False
         return None
 
+    # noinspection PyDefaultArgument
     def visit_AnnAssign(self, node: cst.AnnAssign) -> bool | None:
         if self._active:
             index = self._provider.get_metadata(IndexProvider, node.target)
             names = self._get_lhs_names(node.target)
-            self._tfs[Node(index, 0)] = lambda lives: lives.difference(names)
+            self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
 
+    # noinspection PyDefaultArgument
     def visit_Assign(self, node: cst.Assign) -> bool | None:
         if self._active:
             for target in node.targets:
                 index = self._provider.get_metadata(IndexProvider, target)
                 names = self._get_lhs_names(target.target)
-                self._tfs[Node(index, 0)] = lambda lives: lives.difference(names)
+                self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
 
+    # noinspection PyDefaultArgument
     def visit_AugAssign(self, node: cst.AugAssign) -> bool | None:
         if self._active:
             index = self._provider.get_metadata(IndexProvider, node)
             names = self._get_lhs_names(node.target)
-            self._tfs[Node(index, 0)] = lambda lives: lives.difference(names)
+            self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
 
     def visit_Name(self, node: cst.Name) -> bool | None:
         if self._active:
@@ -84,7 +89,8 @@ class CollectLiveVariablesTransferFunctions(cst.CSTVisitor):
                 [qual_name] = name_origin
                 if qual_name.source == QualifiedNameSource.LOCAL:
                     index = self._provider.get_metadata(IndexProvider, node)
-                    self._tfs[Node(index, 0)] = lambda lives: lives.union([node.value])
+                    name = node.value
+                    self._tfs[Node(index, 0)] = lambda lives, name=name: lives.union([name])
 
     def visit_FunctionDef_params(self, _node: cst.FunctionDef) -> None:
         self._active = True

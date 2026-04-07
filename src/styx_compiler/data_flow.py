@@ -40,8 +40,8 @@ def compute_sccs(cfg: Cfg, extremals: list[Node]) -> list[list[Node]]:
         node_lowlink[node] = index
         index += 1
         node_on_stack.add(node)
-        # N.B. we don't add node to scc_stack here, only to the node_on_stack set. The set is used next and in the recursive
-        #  calls, so it doesn't affect the algorithm's correctness to postpone adding to scc_stack.
+        # N.B. we don't add node to scc_stack here, only to the node_on_stack set. The set is used next and in the
+        #  recursive calls, so it doesn't affect the algorithm's correctness to postpone adding to scc_stack.
 
         for next_node in cfg.get(node, set()):
             if next_node not in node_index:

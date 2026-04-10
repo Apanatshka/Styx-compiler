@@ -18,6 +18,28 @@ def normalize_function_body(node: cst.FunctionDef) -> cst.FunctionDef:
     return node
 
 
+def normalize_inline_if(node: cst.If) -> cst.If:
+    """Convert inline if/elif/else bodies (SimpleStatementSuite) to IndentedBlock.
+
+    Inline ifs like `if x: return False` parse with SimpleStatementSuite.
+    The processor and other transforms assume IndentedBlock, so we normalize here.
+    """
+    # Normalize the if-body
+    if isinstance(node.body, cst.SimpleStatementSuite):
+        new_body = cst.IndentedBlock(body=[cst.SimpleStatementLine(body=list(node.body.body))])
+        node = node.with_changes(body=new_body)
+
+    # Normalize the else/elif
+    if node.orelse is not None:
+        if isinstance(node.orelse, cst.Else) and isinstance(node.orelse.body, cst.SimpleStatementSuite):
+            new_else_body = cst.IndentedBlock(body=[cst.SimpleStatementLine(body=list(node.orelse.body.body))])
+            node = node.with_changes(orelse=node.orelse.with_changes(body=new_else_body))
+        elif isinstance(node.orelse, cst.If):
+            node = node.with_changes(orelse=normalize_inline_if(node.orelse))
+
+    return node
+
+
 class ReturnHandlerTransformer(cst.CSTTransformer):
     """
     Finds 'return' statements and wraps them with the reply_to stack logic.
@@ -93,9 +115,9 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
         return any(param.name.value == "reply_to" for param in node.params.params)
 
     def leave_SimpleStatementLine(self, _original_node, updated_node):
-        # Handle ctx.call_remote_async: prepend ctx.put(state) if uses_state
+        # Handle ctx.call_remote_async: prepend ctx.put(__state__) if uses_state
         if self._is_call_remote_async(updated_node) and self.uses_state:
-            put_state = cst.parse_statement("ctx.put(state)")
+            put_state = cst.parse_statement("ctx.put(__state__)")
             return cst.FlattenSentinel([put_state, updated_node])
 
         return_node = None
@@ -126,7 +148,7 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
 
         res_stmt = cst.SimpleStatementLine(body=[cst.Return(value=send_reply_call)])
 
-        put_state = cst.parse_statement("ctx.put(state)")
+        put_state = cst.parse_statement("ctx.put(__state__)")
 
         return cst.FlattenSentinel([put_state, res_stmt]) if self.uses_state else res_stmt
 
@@ -139,11 +161,11 @@ class ReturnHandlerTransformer(cst.CSTTransformer):
             # Add send_reply for functions with reply_to so the reply chain isn't lost
             if self._has_reply_to_param(updated_node):
                 if self.uses_state:
-                    new_body.append(cst.parse_statement("ctx.put(state)"))
+                    new_body.append(cst.parse_statement("ctx.put(__state__)"))
                 new_body.append(cst.parse_statement("return send_reply(ctx, reply_to, None)"))
             elif self.uses_state:
                 # No reply_to but state used — just flush state
-                new_body.append(cst.parse_statement("ctx.put(state)"))
+                new_body.append(cst.parse_statement("ctx.put(__state__)"))
 
             if new_body != list(updated_node.body.body):
                 return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
@@ -242,6 +264,9 @@ class StatementLinearizer(cst.CSTTransformer):
 
     def leave_If(self, _original_node: cst.If, updated_node: cst.If) -> cst.If | cst.FlattenSentinel[cst.BaseStatement]:
         """Handle if statements specially."""
+        # Normalize inline if bodies (SimpleStatementSuite -> IndentedBlock)
+        updated_node = normalize_inline_if(updated_node)
+
         new_statements = []
 
         extractor = CallExtractorAndReplacer(self.entities, self.counter)
@@ -293,6 +318,30 @@ class StatementLinearizer(cst.CSTTransformer):
         new_body = updated_node.body.with_changes(body=new_body_stmts)
         new_while = updated_node.with_changes(test=new_test, body=new_body)
         new_statements.append(new_while)
+
+        return cst.FlattenSentinel(new_statements)
+
+    def leave_For(
+        self, _original_node: cst.For, updated_node: cst.For
+    ) -> cst.For | cst.FlattenSentinel[cst.BaseStatement]:
+        """Handle for statements specially, extracting from iter condition."""
+        new_statements = []
+
+        extractor = CallExtractorAndReplacer(self.entities, self.counter)
+        new_iter = updated_node.iter.visit(extractor)
+        self.counter = extractor.counter
+
+        if not extractor.extracted_calls:
+            return updated_node
+
+        for var_name, call in extractor.extracted_calls:
+            assignment = cst.SimpleStatementLine(
+                body=[cst.Assign(targets=[cst.AssignTarget(target=cst.Name(var_name))], value=call)]
+            )
+            new_statements.append(assignment)
+
+        new_for = updated_node.with_changes(iter=new_iter)
+        new_statements.append(new_for)
 
         return cst.FlattenSentinel(new_statements)
 
@@ -413,12 +462,98 @@ class StateAccessTransformer(cst.CSTTransformer):
     1. self.attribute -> state['attribute']
     2. self           -> ctx.key
     3. self.__key__() -> ctx.key
+    4. get_enity_by_key(Entity, key) -> key
     """
+
+    def __init__(self, metadata=None, entity_keys=None, entity_init_params=None):
+        super().__init__()
+        self.metadata = metadata or {}
+        self.entity_keys = entity_keys or {}
+        self.entity_init_params = entity_init_params or {}
+
+    def _get_node_type(self, node):
+        """Helper to get the type name from mypy metadata or CST node type (for literals)."""
+        mypy_type = self.metadata.get(node)
+        if mypy_type:
+            # Simple extraction for the print statement
+            fullname = mypy_type.fullname
+            return fullname.rsplit(".", 1)[-1]
+
+        # Fallback for literals
+        if isinstance(node, cst.SimpleString):
+            return "str"
+        if isinstance(node, cst.Integer):
+            return "int"
+        if isinstance(node, cst.Float):
+            return "float"
+        if isinstance(node, cst.Name) and node.value in ("True", "False"):
+            return "bool"
+        return "None"
 
     def leave_Call(self, original_node, updated_node):
         # Handles self.__key__() -> ctx.key
         if m.matches(original_node, m.Call(func=m.Attribute(value=m.Name("self"), attr=m.Name("__key__")))):
             return cst.Attribute(value=cst.Name("ctx"), attr=cst.Name("key"))
+
+        # Handles get_enity_by_key(Entity, key) -> key
+        if m.matches(original_node, m.Call(func=m.Name("get_enity_by_key"))) and len(updated_node.args) >= 2:
+            entity_node = updated_node.args[0].value
+            key = updated_node.args[1].value
+
+            if isinstance(entity_node, cst.Name):
+                entity_name = entity_node.value
+                key_attrs = self.entity_keys.get(entity_name, [])
+                init_params = self.entity_init_params.get(entity_name, {})
+                expected_types = [init_params.get(a) for a in key_attrs]
+
+                # 1. Structure validation
+                if len(key_attrs) > 1:
+                    if not isinstance(key, cst.Tuple):
+                        actual_type = self._get_node_type(key)
+                        msg = (
+                            f"get_entity_by_key for {entity_name} expects a tuple "
+                            f"for composite key, but got {actual_type}"
+                        )
+                        raise TypeError(msg)
+
+                    if len(key.elements) != len(key_attrs):
+                        msg = (
+                            f"get_entity_by_key for {entity_name} expects "
+                            f"{len(key_attrs)} elements, but got {len(key.elements)}"
+                        )
+                        raise TypeError(msg)
+
+                # 2. Collect types for comparison and reporting
+                if isinstance(key, cst.Tuple):
+                    actual_types = []
+                    original_tuple = original_node.args[1].value
+                    for i, _element in enumerate(key.elements):
+                        original_element = original_tuple.elements[i].value
+                        actual_types.append(self._get_node_type(original_element))
+
+                    # Check for mismatches
+                    for _i, (actual, expected) in enumerate(zip(actual_types, expected_types, strict=True)):
+                        if actual != expected:
+                            expected_str = f"({', '.join(expected_types)})"
+                            actual_str = f"({', '.join(actual_types)})"
+                            msg = (
+                                f"Type mismatch for retrieving '{entity_name}' by key: "
+                                f"expected {expected_str}, got {actual_str}"
+                            )
+                            raise TypeError(msg)
+                else:
+                    original_key = original_node.args[1].value
+                    actual_type = self._get_node_type(original_key)
+                    expected_type = expected_types[0] if expected_types else None
+                    if expected_type and actual_type != expected_type:
+                        msg = (
+                            f"Type mismatch for retrieving '{entity_name}' by key: "
+                            f"expected {expected_type}, got {actual_type}"
+                        )
+                        raise TypeError(msg)
+
+            return updated_node.args[1].value
+
         return updated_node
 
     def leave_AnnAssign(self, _original_node, updated_node):
@@ -430,10 +565,10 @@ class StateAccessTransformer(cst.CSTTransformer):
         return updated_node
 
     def leave_Attribute(self, original_node, updated_node):
-        # Handles self.attribute -> state['attribute']
+        # Handles self.attribute -> __state__['attribute']
         if m.matches(original_node, m.Attribute(value=m.Name("self"))):
             return cst.Subscript(
-                value=cst.Name("state"),
+                value=cst.Name("__state__"),
                 slice=[cst.SubscriptElement(slice=cst.Index(value=cst.SimpleString(f"'{original_node.attr.value}'")))],
             )
         return updated_node
@@ -464,17 +599,41 @@ class EntityTypeReplacer(cst.CSTTransformer):
     Also handles: `items: list[Item]` -> `items: list[str]`, `list[list[Item]]` -> `list[list[str]]`
     """
 
-    def __init__(self, entity_keys: dict[str, str], entity_init_params: dict[str, dict[str, str]]):
+    def __init__(
+        self,
+        entity_keys: dict[str, str],
+        entity_init_params: dict[str, dict[str, str]],
+        entity_key_types: dict[str, str] | None = None,
+    ):
         super().__init__()
         self.entity_keys = entity_keys
         self.entity_init_params = entity_init_params
+        self.entity_key_types = entity_key_types or {}
 
     def _get_key_type(self, entity_name: str):
         """Resolve an entity name to its key's type string, or None."""
-        key_field = self.entity_keys.get(entity_name)
+        # 1. Check if we explicitly found a return type for __key__
+        if entity_name in self.entity_key_types:
+            return self.entity_key_types[entity_name]
+
+        # 2. Check if the key field is in __init__ params
+        key_fields = self.entity_keys.get(entity_name)
         init_params = self.entity_init_params.get(entity_name)
-        if key_field and init_params and key_field in init_params:
-            return init_params[key_field]
+
+        if key_fields and isinstance(key_fields, list):
+            if len(key_fields) > 1:
+                # Composite keys are concatenated into strings
+                return "str"
+
+            # Single key: use its original type
+            key_field = key_fields[0]
+            if init_params and key_field in init_params:
+                return init_params[key_field]
+
+        # 3. Fallback: if it's a known entity, default to str
+        if entity_name in self.entity_keys:
+            return "str"
+
         return None
 
     def leave_Annotation(self, _original_node, updated_node):

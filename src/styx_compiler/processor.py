@@ -14,7 +14,7 @@ class FunctionProcessor:
         class_name: str,
         entities: dict[str, str],
         metadata: Mapping,
-        entity_keys: dict[str, str] | None = None,
+        entity_keys: dict[str, list[str]] | None = None,
         entity_init_params: dict[str, list[str]] | None = None,
     ):
         self.original_func = original_func
@@ -446,7 +446,7 @@ class FunctionProcessor:
                     for target in element.targets:
                         if isinstance(target.target, cst.Name):
                             var_name = target.target.value
-                            if var_name != "state":
+                            if var_name != "__state__":
                                 self.defined_vars.add(var_name)
         elif isinstance(stmt, cst.If):
             for s in stmt.body.body:
@@ -626,8 +626,17 @@ class FunctionProcessor:
         """Extract the outermost class name, ignoring generics.
         e.g. 'builtins.list[module.Item]' -> 'list'
              'test_tmp.Item' -> 'Item'
+             'test_tmp.Item | None' -> 'Item'  (Optional unwrapping)
         """
         fullname = mypy_type.fullname
+
+        # Handle Optional / Union types: 'module.Item | None' -> 'module.Item'
+        # Optional[X] is represented by mypy as 'X | None'
+        if " | " in fullname:
+            parts = [p.strip() for p in fullname.split(" | ") if p.strip() != "None"]
+            if len(parts) == 1:
+                fullname = parts[0]
+
         # Drop generic part: 'builtins.list[module.Item]' -> 'builtins.list'
         if "[" in fullname:
             fullname = fullname.split("[")[0]
@@ -648,20 +657,39 @@ class FunctionProcessor:
     def _resolve_key_for_call(self, receiver, call_node, method):
         """
         Resolve the correct key= argument for a remote call.
-        For constructor calls (method='create'), look up which __init__ param
-        is the key field and pick the corresponding argument from the call.
+        For constructor calls (method='create'), build the key expression from attributes.
         For method calls, the receiver variable IS the key.
         """
         if method == "create" and isinstance(receiver, cst.Name):
             entity_class = receiver.value
-            key_field = self.entity_keys.get(entity_class)
+            key_attrs = self.entity_keys.get(entity_class)
             init_params = self.entity_init_params.get(entity_class)
 
-            if key_field and init_params and key_field in init_params:
+            if key_attrs and init_params:
                 param_names = list(init_params.keys())
-                key_index = param_names.index(key_field)
-                if key_index < len(call_node.args):
-                    return call_node.args[key_index].value
+                resolved_parts = []
+                for attr in key_attrs:
+                    if attr in param_names:
+                        idx = param_names.index(attr)
+                        if idx < len(call_node.args):
+                            arg_val = call_node.args[idx].value
+                            # Multi-key case: wrap everything in str() and concatenate with ":"
+                            if len(key_attrs) > 1:
+                                resolved_parts.append(cst.Call(func=cst.Name("str"), args=[cst.Arg(value=arg_val)]))
+                            else:
+                                # Single key case:
+                                return arg_val
+
+                if len(resolved_parts) > 1:
+                    # Join with + ":" +
+                    expr = resolved_parts[0]
+                    for part in resolved_parts[1:]:
+                        expr = cst.BinaryOperation(
+                            left=cst.BinaryOperation(left=expr, operator=cst.Add(), right=cst.SimpleString('":"')),
+                            operator=cst.Add(),
+                            right=part,
+                        )
+                    return expr
 
         # Fallback: use the receiver itself (works for method calls like item.get_price())
         return receiver

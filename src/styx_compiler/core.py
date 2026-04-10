@@ -26,8 +26,8 @@ from styx_compiler.visitor import EntityDiscoveryVisitor
 
 
 def _uses_state(node: cst.CSTNode) -> bool:
-    """Recursively checks whether any Name('state') appears in the CST subtree."""
-    if isinstance(node, cst.Name) and node.value == "state":
+    """Recursively checks whether any Name('__state__') appears in the CST subtree."""
+    if isinstance(node, cst.Name) and node.value == "__state__":
         return True
     return any(_uses_state(child) for child in node.children)
 
@@ -41,13 +41,16 @@ class StyxTransformer(cst.CSTTransformer):
         self,
         entities: dict[str, str],
         metadata: Mapping,
-        entity_keys: dict[str, str] | None = None,
+        entity_keys: dict[str, list[str]] | None = None,
         entity_init_params: dict[str, list[str]] | None = None,
     ):
         super().__init__()
         self.entities = entities
         self.metadata = metadata
         self.entity_keys = entity_keys or {}
+        self.entity_key_types = (
+            getattr(metadata, "entity_key_types", {}) if hasattr(metadata, "entity_key_types") else {}
+        )
         self.entity_init_params = entity_init_params or {}
         self.current_operator = None
         self.self_attr_types = None
@@ -88,8 +91,10 @@ def push_continuation(
     ctx: StatefulFunction, reply_to: list, op_name: str, fun: str, step_id: str, context: dict
 ) -> list:
     context_dict = ctx.get_func_context()
-    continuation_id = str(uuid.uuid4())
-    context_dict[continuation_id] = context
+    next_id = context_dict.get("next_id", 0)
+    context_dict["next_id"] = next_id + 1
+
+    context_dict[next_id] = context
     ctx.put_func_context(context_dict)
     if reply_to is None:
         reply_to = []
@@ -98,7 +103,7 @@ def push_continuation(
             "op_name": op_name,
             "fun": fun,
             "id": step_id,
-            "context": continuation_id,
+            "context": next_id,
         }
     )
     return reply_to
@@ -179,7 +184,7 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
         )
         new_params = [ctx_param] + [p for p in node.params.params if p.name.value != "self"] + [reply_to_param]
 
-        init_state = cst.parse_statement("state = {}")
+        init_state = cst.parse_statement("__state__ = {}")
         put_func_state = cst.parse_statement("ctx.put_func_context({})")
         return_stmt = cst.parse_statement("return ctx.key")
 
@@ -207,12 +212,12 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
         decorator = cst.Decorator(decorator=cst.Attribute(value=cst.Name(decorator_name), attr=cst.Name("register")))
 
         for func in new_functions:
-            state_transformer = StateAccessTransformer()
+            state_transformer = StateAccessTransformer(self.metadata, self.entity_keys, self.entity_init_params)
             transformed_func = func.visit(state_transformer)
 
-            # Prepend `state = ctx.get()` ONLY for continuations of insert
+            # Prepend `__state__ = ctx.get()` ONLY for continuations of insert
             if _uses_state(transformed_func) and transformed_func.name.value != "insert":
-                get_state = cst.parse_statement("state = ctx.get()")
+                get_state = cst.parse_statement("__state__ = ctx.get()")
                 transformed_func = transformed_func.with_changes(
                     body=cst.IndentedBlock(body=[get_state, *list(transformed_func.body.body)])
                 )
@@ -245,12 +250,12 @@ def resolve_context(ctx: StatefulFunction, context_data) -> dict:
         final_nodes = []
 
         for func in new_functions:
-            state_transformer = StateAccessTransformer()
+            state_transformer = StateAccessTransformer(self.metadata, self.entity_keys, self.entity_init_params)
             transformed_func = func.visit(state_transformer)
 
-            # Ensure any function that uses `state` loads it from ctx
+            # Ensure any function that uses `__state__` loads it from ctx
             if _uses_state(transformed_func):
-                get_state = cst.parse_statement("state = ctx.get()")
+                get_state = cst.parse_statement("__state__ = ctx.get()")
                 transformed_func = transformed_func.with_changes(
                     body=cst.IndentedBlock(body=[get_state, *list(transformed_func.body.body)])
                 )
@@ -312,6 +317,7 @@ class StyxTranspiler:
         self.cst_tree.visit(visitor)
         self.entities = visitor.entities
         self.entity_keys = visitor.entity_keys
+        self.entity_key_types = visitor.entity_key_types
         self.entity_init_params = visitor.entity_init_params
         print(f"Identified {len(self.entities)} stateful entities:", list(self.entities.keys()))
 
@@ -333,7 +339,7 @@ class StyxTranspiler:
         modified_tree = module.visit(transformer)
 
         # 5. Replace entity type annotations with key types
-        type_replacer = EntityTypeReplacer(self.entity_keys, self.entity_init_params)
+        type_replacer = EntityTypeReplacer(self.entity_keys, self.entity_init_params, self.entity_key_types)
         modified_tree = modified_tree.visit(type_replacer)
 
         return modified_tree.code

@@ -39,6 +39,8 @@ def compute_sccs(cfg: Cfg, extremals: list[Node]) -> list[list[Node]]:
         node_index[node] = index
         node_lowlink[node] = index
         index += 1
+
+        stack_set_size = len(node_on_stack)
         node_on_stack.add(node)
         # N.B. we don't add node to scc_stack here, only to the node_on_stack set. The set is used next and in the
         #  recursive calls, so it doesn't affect the algorithm's correctness to postpone adding to scc_stack.
@@ -54,9 +56,8 @@ def compute_sccs(cfg: Cfg, extremals: list[Node]) -> list[list[Node]]:
         scc_stack.append(node)
 
         if node_lowlink[node] == node_index[node]:
-            scc = [scc_stack.pop()]
-            node_on_stack.remove(scc[-1])
-            while scc[-1] != node:
+            scc = []
+            for _ in range(len(node_on_stack), stack_set_size, -1):
                 scc.append(scc_stack.pop())
                 node_on_stack.remove(scc[-1])
             result.append(list(reversed(scc)))

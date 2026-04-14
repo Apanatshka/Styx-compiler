@@ -99,12 +99,6 @@ class CollectLiveVariablesTransferFunctions(cst.CSTVisitor):
         if result is not None:
             self._tfs[Node(index, 0)] = lambda lives, names=result: lives.union(names)
 
-    def visit_Attribute(self, node: cst.Attribute) -> bool | None:
-        index = self._provider.get_metadata(IndexProvider, node)
-        result = self.resolve_name(node)
-        if result is not None:
-            self._tfs[Node(index, 0)] = lambda lives, names=result: lives.union(names)
-
 
 class LiveVariablesDataflowPropertyProvider(cst.BatchableMetadataProvider[DataflowProperty]):
     METADATA_DEPENDENCIES = (IndexProvider, QualifiedNameProvider)

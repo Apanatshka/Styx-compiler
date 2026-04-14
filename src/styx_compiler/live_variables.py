@@ -1,5 +1,5 @@
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import libcst as cst
 from libcst import matchers as m
@@ -18,20 +18,27 @@ class CollectLiveVariablesTransferFunctions(cst.CSTVisitor):
     def __init__(self, provider: LiveVariablesDataflowPropertyProvider):
         super().__init__()
         self._provider = provider
-        self._active = False
-        self._tfs: dict[Node, Callable[[frozenset[str]], frozenset[str]]] = defaultdict(lambda: lambda x: x)
+        self._tfs: dict[Node, Callable[[frozenset[QualifiedName]], frozenset[QualifiedName]]] = defaultdict(
+            lambda: lambda x: x
+        )
+
+    def resolve_name(self, node: cst.CSTNode) -> Sequence[QualifiedName] | None:
+        name_origin: set[QualifiedName] = self._provider.get_metadata(QualifiedNameProvider, node)
+        if len(name_origin) == 1:
+            [qual_name] = name_origin
+            if qual_name.source == QualifiedNameSource.LOCAL:
+                return [qual_name]
+        return None
 
     def get_dataflow_property(self) -> DataflowProperty:
         return DataflowProperty(forward=False, initial=frozenset(), transfer_func=self._tfs, lattice=MaySet())
 
-    def _get_lhs_names(self, target: cst.BaseExpression) -> list[str]:
+    def _get_lhs_names(self, target: cst.BaseExpression) -> Sequence[QualifiedName]:
         if m.matches(target, m.Attribute()):
             target: cst.Attribute = cst.ensure_type(target, cst.Attribute)
-            name_origin: set[QualifiedName] = self._provider.get_metadata(QualifiedNameProvider, target.attr)
-            if len(name_origin) == 1:
-                [qual_name] = name_origin
-                if qual_name.source == QualifiedNameSource.LOCAL:
-                    return [target.attr.value]
+            result = self.resolve_name(target)
+            if result is not None:
+                return result
         if m.matches(target, m.Subscript()):
             target: cst.Subscript = cst.ensure_type(target, cst.Subscript)
             return self._get_lhs_names(target.value)
@@ -39,11 +46,9 @@ class CollectLiveVariablesTransferFunctions(cst.CSTVisitor):
             return self._get_lhs_names(target.value)
         if m.matches(target, m.Name()):
             target: cst.Name = cst.ensure_type(target, cst.Name)
-            name_origin: set[QualifiedName] = self._provider.get_metadata(QualifiedNameProvider, target)
-            if len(name_origin) == 1:
-                [qual_name] = name_origin
-                if qual_name.source == QualifiedNameSource.LOCAL:
-                    return [target.value]
+            result = self.resolve_name(target)
+            if result is not None:
+                return result
         if m.matches(target, m.List() | m.Tuple()):
             # noinspection PyUnresolvedReferences
             return [name for el in target.elements for name in self._get_lhs_names(el)]
@@ -53,68 +58,52 @@ class CollectLiveVariablesTransferFunctions(cst.CSTVisitor):
         self._provider.set_metadata(module, self.get_dataflow_property())
 
     def visit_Param(self, node: cst.Param) -> bool | None:
-        if self._active:
-            index = self._provider.get_metadata(IndexProvider, node)
-            name = node.name.value
-            self._tfs[Node(index, 0)] = lambda lives, name=name: lives.difference([name])
-            return False
-        return None
+        index = self._provider.get_metadata(IndexProvider, node)
+        result = self.resolve_name(node.name)
+        if result is not None:
+            self._tfs[Node(index, 0)] = lambda lives, names=result: lives.difference(names)
 
-    # noinspection PyDefaultArgument
     def visit_AnnAssign(self, node: cst.AnnAssign) -> bool | None:
-        if self._active:
-            index = self._provider.get_metadata(IndexProvider, node.target)
-            names = self._get_lhs_names(node.target)
-            self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
+        index = self._provider.get_metadata(IndexProvider, node)
+        names = self._get_lhs_names(node.target)
+        self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
 
-    # noinspection PyDefaultArgument
-    def visit_Assign(self, node: cst.Assign) -> bool | None:
-        if self._active:
-            for target in node.targets:
-                index = self._provider.get_metadata(IndexProvider, target)
-                names = self._get_lhs_names(target.target)
-                self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
+    def visit_AssignTarget(self, node: cst.AssignTarget) -> bool | None:
+        index = self._provider.get_metadata(IndexProvider, node)
+        names = self._get_lhs_names(node.target)
+        self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
 
-    # noinspection PyDefaultArgument
     def visit_AugAssign(self, node: cst.AugAssign) -> bool | None:
-        if self._active:
-            index = self._provider.get_metadata(IndexProvider, node)
-            names = self._get_lhs_names(node.target)
-            self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
+        index = self._provider.get_metadata(IndexProvider, node)
+        names = self._get_lhs_names(node.target)
+        self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
+
+    def visit_Del(self, node: cst.Del) -> bool | None:
+        index = self._provider.get_metadata(IndexProvider, node)
+        names = self._get_lhs_names(node.target)
+        self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
+
+    def visit_For(self, node: cst.For) -> bool | None:
+        index = self._provider.get_metadata(IndexProvider, node)
+        names = self._get_lhs_names(node.target)
+        self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
+
+    def visit_AsName(self, node: cst.AsName) -> bool | None:
+        index = self._provider.get_metadata(IndexProvider, node)
+        names = self._get_lhs_names(node.name)
+        self._tfs[Node(index, 0)] = lambda lives, names=names: lives.difference(names)
 
     def visit_Name(self, node: cst.Name) -> bool | None:
-        if self._active:
-            name_origin: set[QualifiedName] = self._provider.get_metadata(QualifiedNameProvider, node)
-            if len(name_origin) == 1:
-                [qual_name] = name_origin
-                if qual_name.source == QualifiedNameSource.LOCAL:
-                    index = self._provider.get_metadata(IndexProvider, node)
-                    name = node.value
-                    self._tfs[Node(index, 0)] = lambda lives, name=name: lives.union([name])
+        index = self._provider.get_metadata(IndexProvider, node)
+        result = self.resolve_name(node)
+        if result is not None:
+            self._tfs[Node(index, 0)] = lambda lives, names=result: lives.union(names)
 
-    def visit_FunctionDef_params(self, _node: cst.FunctionDef) -> None:
-        self._active = True
-
-    def leave_FunctionDef_params(self, _node: cst.FunctionDef) -> None:
-        self._active = False
-
-    def visit_FunctionDef_body(self, _node: cst.FunctionDef) -> None:
-        self._active = True
-
-    def leave_FunctionDef_body(self, _node: cst.FunctionDef) -> None:
-        self._active = False
-
-    def visit_AnnAssign_annotation(self, _node: cst.FunctionDef) -> None:
-        self._active = False
-
-    def leave_AnnAssign_annotation(self, _node: cst.FunctionDef) -> None:
-        self._active = True
-
-    def visit_Attribute_attr(self, _node: cst.FunctionDef) -> None:
-        self._active = False
-
-    def leave_Attribute_attr(self, _node: cst.FunctionDef) -> None:
-        self._active = True
+    def visit_Attribute(self, node: cst.Attribute) -> bool | None:
+        index = self._provider.get_metadata(IndexProvider, node)
+        result = self.resolve_name(node)
+        if result is not None:
+            self._tfs[Node(index, 0)] = lambda lives, names=result: lives.union(names)
 
 
 class LiveVariablesDataflowPropertyProvider(cst.BatchableMetadataProvider[DataflowProperty]):
@@ -126,11 +115,13 @@ class LiveVariablesDataflowPropertyProvider(cst.BatchableMetadataProvider[Datafl
 
 class LiveVariablesVisitor(cst.CSTVisitor):
     def __init__(
-        self, provider: LiveVariablesProvider, live_vars: dict[Node, tuple[TB[frozenset[str]], TB[frozenset[str]]]]
+        self,
+        provider: LiveVariablesProvider,
+        live_vars: dict[Node, tuple[TB[frozenset[QualifiedName]], TB[frozenset[QualifiedName]]]],
     ):
         super().__init__()
         self._provider: LiveVariablesProvider = provider
-        self.live_vars: dict[Node, tuple[TB[frozenset[str]], TB[frozenset[str]]]] = live_vars
+        self.live_vars: dict[Node, tuple[TB[frozenset[QualifiedName]], TB[frozenset[QualifiedName]]]] = live_vars
 
     def on_visit(self, node: cst.CSTNode) -> bool:
         if m.matches(node, m.SimpleWhitespace() | m.TrailingWhitespace()):
@@ -142,7 +133,9 @@ class LiveVariablesVisitor(cst.CSTVisitor):
         return True
 
 
-class LiveVariablesProvider(cst.BatchableMetadataProvider[tuple[frozenset[TB[str]], frozenset[TB[str]]]]):
+class LiveVariablesProvider(
+    cst.BatchableMetadataProvider[tuple[frozenset[TB[QualifiedName]], frozenset[TB[QualifiedName]]]]
+):
     METADATA_DEPENDENCIES = (IndexProvider, ControlFlowGraphProvider, LiveVariablesDataflowPropertyProvider)
 
     def visit_Module(self, node: cst.Module) -> bool | None:

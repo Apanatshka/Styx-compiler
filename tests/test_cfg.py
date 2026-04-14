@@ -1,26 +1,15 @@
 """Tests for styx_compiler.control_flow."""
 
 import libcst as cst
+import libcst.matchers as m
 
-from styx_compiler.control_flow import ControlFlowGraphProvider, Node
+from styx_compiler.control_flow import CfgNode, ControlFlowGraphProvider, Node
 from styx_compiler.metadata_providers import IndexProvider
 
 add_fundef = """
 def add(a: int, b: int) -> int:
     return a + b
 """
-
-
-# def test_add_fundef_cfg():
-#     source_tree = cst.parse_module(add_fundef)
-#     wrapper = cst.MetadataWrapper(source_tree)
-#     cfgp = ControlFlowGraphProvider()
-#     ccfg = ComputeControlFlowGraph(cfgp)
-#     assert len(ccfg._cfg) == 0
-#     wrapper.visit(ccfg)
-#     print(ccfg._cfg)
-#     assert len(ccfg._cfg) > 0
-#     assert len(ccfg._start_end) == 1
 
 
 user_item = """
@@ -49,16 +38,6 @@ class Item:
 """
 
 
-# def test_multi_def_cfg():
-#     source_tree = cst.parse_module(user_item)
-#     wrapper = cst.MetadataWrapper(source_tree)
-#     cfgp = ControlFlowGraphProvider()
-#     ccfg = ComputeControlFlowGraph(cfgp)
-#     wrapper.visit(ccfg)
-#     print(ccfg._cfg)
-#     assert len(ccfg._start_end) == 5
-
-
 nested_try = """
 def nested_try(a: int) -> int:
     try:
@@ -84,18 +63,6 @@ def nested_try(a: int) -> int:
             return 9001
     return a + 42
 """
-
-
-# def test_nested_try_cfg():
-#     source_tree = cst.parse_module(nested_try)
-#     wrapper = cst.MetadataWrapper(source_tree)
-#     cfgp = ControlFlowGraphProvider()
-#     ccfg = ComputeControlFlowGraph(cfgp)
-#     assert len(ccfg._cfg) == 0
-#     wrapper.visit(ccfg)
-#     print(ccfg._cfg)
-#     assert len(ccfg._cfg) > 0
-#     print(sum(1 for v in ccfg._cfg.values() if len(v) > 1))
 
 
 def test_node_existence():
@@ -302,3 +269,142 @@ class CfgNodeTester(cst.CSTVisitor):
 
     def leave_Attribute_attr(self, _node: cst.FunctionDef) -> None:
         self.active = True
+
+
+loop_test = """
+@entity
+class Something:
+    def loop_test(self, cart: list[Item]) -> int:
+        val = 0
+
+        for item in cart:
+            attr_1 = item.get_price()
+            val += attr_1
+
+        temp = 3
+
+        val += temp
+
+        return val
+"""
+
+
+def test_loop_test_cfg():
+    module = cst.parse_module(loop_test)
+    wrapper = cst.MetadataWrapper(module)
+    ltct = LoopTestCfgTester()
+    wrapper.visit(ltct)
+
+
+class LoopTestCfgTester(cst.CSTVisitor):
+    METADATA_DEPENDENCIES = (IndexProvider, ControlFlowGraphProvider)
+
+    def __init__(self):
+        super().__init__()
+        self.cfg: dict[CfgNode, set[CfgNode]] | None = None
+        self.start_end: list[tuple[CfgNode, CfgNode]] | None = None
+
+    def is_edge(self, from_node: CfgNode, to_node: CfgNode) -> bool:
+        return from_node in self.cfg and to_node in self.cfg[from_node]
+
+    def assert_node(self, node: cst.CSTNode, prev: CfgNode) -> CfgNode:
+        cfg_node = Node(self.get_metadata(IndexProvider, node), 0)
+        assert cfg_node in self.cfg
+        assert self.is_edge(prev, cfg_node)
+        return cfg_node
+
+    def visit_Module(self, node: cst.Module) -> bool | None:
+        self.cfg, self.start_end = self.get_metadata(ControlFlowGraphProvider, node)
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool | None:
+        assert node.name.value == "loop_test"
+
+        # unpack
+
+        init_val: cst.Assign
+        for_loop: cst.For
+        init_temp: cst.Assign
+        update_val: cst.AugAssign
+        return_val: cst.Return
+
+        init_val, for_loop, init_temp, update_val, return_val = (
+            cst.ensure_type(ssl, cst.SimpleStatementLine).body[0] if m.matches(ssl, m.SimpleStatementLine()) else ssl
+            for ssl in node.body.body
+        )
+
+        for_iter_cart: cst.Name = cst.ensure_type(for_loop.iter, cst.Name)
+
+        for_init_attr_1: cst.Assign
+        for_update_val: cst.AugAssign
+
+        for_init_attr_1, for_update_val = (
+            cst.ensure_type(ssl, cst.SimpleStatementLine).body[0] for ssl in for_loop.body.body
+        )
+
+        for_init_attr_1_call: cst.Call = cst.ensure_type(for_init_attr_1.value, cst.Call)
+        for_init_attr_1_call_expr: cst.Attribute = cst.ensure_type(for_init_attr_1_call.func, cst.Attribute)
+        for_init_attr_1_call_item: cst.Name = cst.ensure_type(for_init_attr_1_call_expr.value, cst.Name)
+
+        # FunctionDef
+
+        index = self.get_metadata(IndexProvider, node)
+        start = Node(index, 0)
+        end = Node(index, 1)
+        assert start in self.cfg
+
+        assert (start, end) in self.start_end
+
+        param_names = ["self", "cart"]
+        prev = start
+        for param, param_name in zip(node.params.params, param_names, strict=True):
+            assert param.name.value == param_name
+            prev = self.assert_node(param, prev)
+
+        # FunctionDef Assign
+
+        prev = self.assert_node(init_val.value, prev)
+        prev = self.assert_node(init_val.targets[0], prev)
+
+        # FunctionDef For
+
+        prev = self.assert_node(for_iter_cart, prev)
+        prev = self.assert_node(for_loop, prev)
+
+        # FunctionDef For Assign Call Attribute
+
+        prev = self.assert_node(for_init_attr_1_call_item, prev)
+        prev = self.assert_node(for_init_attr_1_call_expr, prev)
+
+        # FunctionDef For Assign Call
+
+        prev = self.assert_node(for_init_attr_1_call, prev)
+
+        # FunctionDef For Assign
+
+        prev = self.assert_node(for_init_attr_1.targets[0], prev)
+
+        # FunctionDef For AugAssign
+
+        prev = self.assert_node(for_update_val.target, prev)
+        prev = self.assert_node(for_update_val.value, prev)
+        prev = self.assert_node(for_update_val, prev)
+
+        # FunctionDef For (back-edge)
+
+        assert self.is_edge(prev, Node(self.get_metadata(IndexProvider, for_iter_cart), 0))
+
+        # FunctionDef Assign
+
+        prev = self.assert_node(init_temp.value, prev)
+        prev = self.assert_node(init_temp.targets[0], prev)
+
+        # FunctionDef AugAssign
+
+        prev = self.assert_node(update_val.target, prev)
+        prev = self.assert_node(update_val.value, prev)
+        prev = self.assert_node(update_val, prev)
+
+        # FunctionDef Return
+
+        prev = self.assert_node(return_val.value, prev)
+        assert self.is_edge(prev, end)

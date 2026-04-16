@@ -1,6 +1,7 @@
 """Tests for styx_compiler.live_variables and indirectly for styx_compiler.data_flow."""
 
 import libcst as cst
+import libcst.matchers as m
 from libcst.metadata import QualifiedName, QualifiedNameSource
 
 from styx_compiler.control_flow import ControlFlowGraphProvider, Node
@@ -105,7 +106,7 @@ class LiveVariablesTester2(cst.CSTVisitor):
 
     def visit_Call(self, node: cst.Call) -> bool | None:
         assert self.get_metadata(LiveVariablesProvider, node, None)[1] == frozenset(
-            [self.local("val"), self.local("item.get_price"), self.local("cart")]
+            [self.local("val"), self.local("cart")]
         )
 
     # def visit_AugAssign(self, node: cst.AugAssign) -> bool | None:
@@ -126,3 +127,146 @@ class LiveVariablesTester2(cst.CSTVisitor):
     # def visit_Return(self, node: cst.Return) -> bool | None:
     #     print(node)
     #     print(self.get_metadata(LiveVariablesProvider, node.value, None))
+
+
+subscript_assign = """
+def subscript_assign(lst, i, val):
+    lst[i] = val
+    return lst
+"""
+
+
+def test_subscript_assign_keeps_list_live():
+    """lst[i] = val must not kill lst — lst is mutated, not redefined."""
+    source_tree = cst.parse_module(subscript_assign)
+    wrapper = cst.MetadataWrapper(source_tree)
+    wrapper.visit(SubscriptAssignTester())
+
+
+class SubscriptAssignTester(cst.CSTVisitor):
+    METADATA_DEPENDENCIES = (LiveVariablesProvider,)
+
+    @staticmethod
+    def local(name: str) -> QualifiedName:
+        return QualifiedName(name=f"subscript_assign.<locals>.{name}", source=QualifiedNameSource.LOCAL)
+
+    def visit_AssignTarget(self, node: cst.AssignTarget) -> bool | None:
+        live_in, live_out = self.get_metadata(LiveVariablesProvider, node)
+        assert self.local("lst") in live_out
+        assert self.local("lst") in live_in
+
+
+aug_subscript = """
+def aug_subscript(lst, i):
+    lst[i] += 1
+    return lst
+"""
+
+
+def test_aug_subscript_keeps_list_live():
+    source_tree = cst.parse_module(aug_subscript)
+    wrapper = cst.MetadataWrapper(source_tree)
+    wrapper.visit(AugSubscriptTester())
+
+
+class AugSubscriptTester(cst.CSTVisitor):
+    METADATA_DEPENDENCIES = (LiveVariablesProvider,)
+
+    @staticmethod
+    def local(name: str) -> QualifiedName:
+        return QualifiedName(name=f"aug_subscript.<locals>.{name}", source=QualifiedNameSource.LOCAL)
+
+    def visit_AugAssign(self, node: cst.AugAssign) -> bool | None:
+        live_in, live_out = self.get_metadata(LiveVariablesProvider, node)
+        assert self.local("lst") in live_out
+        assert self.local("lst") in live_in
+
+
+method_call_source = """
+def method_call_func(items, item):
+    items.append(item)
+    return items
+"""
+
+
+def test_method_call_does_not_add_method_name():
+    """items.append(item) — 'append' is a method, not a live variable."""
+    source_tree = cst.parse_module(method_call_source)
+    wrapper = cst.MetadataWrapper(source_tree)
+    wrapper.visit(MethodCallLiveVarsTester())
+
+
+class MethodCallLiveVarsTester(cst.CSTVisitor):
+    METADATA_DEPENDENCIES = (LiveVariablesProvider,)
+
+    def visit_Attribute(self, node: cst.Attribute) -> bool | None:
+        metadata = self.get_metadata(LiveVariablesProvider, node, None)
+        if metadata is None:
+            return None
+        live_in, _ = metadata
+        items_append = QualifiedName(
+            name="method_call_func.<locals>.items.append",
+            source=QualifiedNameSource.LOCAL,
+        )
+        assert items_append not in live_in
+
+
+# Advanced test: nested loops with an if condition.
+# Expected live sets computed by hand via backward fixed-point analysis:
+#
+#   Lout (live at outer-loop header xs Name) = {xs, ys, limit, total}
+#   Lin  (live at inner-loop header ys Name) = {xs, ys, x, limit, total}
+#
+# Outer For node kills x  → live_in misses x, live_out has it.
+# Inner For node kills y  → live_in misses y, live_out has it.
+# ComparisonTarget        → all variables x, y, xs, ys, limit, total live.
+# AugAssign kills total   → live_in misses total, live_out has it (needed by
+#                           the next iteration and the return).
+
+nested_loops_if = """
+def nested_loops_if(xs, ys, limit):
+    total = 0
+    for x in xs:
+        for y in ys:
+            if x < limit:
+                total += y
+    return total
+"""
+
+
+def test_nested_loops_if_live_vars():
+    source_tree = cst.parse_module(nested_loops_if)
+    wrapper = cst.MetadataWrapper(source_tree)
+    wrapper.visit(NestedLoopsIfTester())
+
+
+class NestedLoopsIfTester(cst.CSTVisitor):
+    METADATA_DEPENDENCIES = (LiveVariablesProvider,)
+
+    @staticmethod
+    def local(name: str) -> QualifiedName:
+        return QualifiedName(name=f"nested_loops_if.<locals>.{name}", source=QualifiedNameSource.LOCAL)
+
+    def visit_For(self, node: cst.For) -> bool | None:
+        live_in, live_out = self.get_metadata(LiveVariablesProvider, node)
+        xs, ys, x, y, limit, total = (self.local(n) for n in ("xs", "ys", "x", "y", "limit", "total"))
+
+        if m.matches(node.iter, m.Name(value="xs")):
+            assert live_in == frozenset([xs, ys, limit, total])
+            assert live_out == frozenset([xs, ys, x, limit, total])
+
+        elif m.matches(node.iter, m.Name(value="ys")):
+            assert live_in == frozenset([xs, ys, x, limit, total])
+            assert live_out == frozenset([xs, ys, x, y, limit, total])
+
+    def visit_ComparisonTarget(self, node: cst.ComparisonTarget) -> bool | None:
+        live_in, live_out = self.get_metadata(LiveVariablesProvider, node)
+        expected = frozenset(self.local(n) for n in ("xs", "ys", "x", "y", "limit", "total"))
+        assert live_in == expected
+        assert live_out == expected
+
+    def visit_AugAssign(self, node: cst.AugAssign) -> bool | None:
+        live_in, live_out = self.get_metadata(LiveVariablesProvider, node)
+        xs, ys, x, limit, total = (self.local(n) for n in ("xs", "ys", "x", "limit", "total"))
+        assert live_out == frozenset([xs, ys, x, limit, total])
+        assert live_in == frozenset([xs, ys, x, limit])
